@@ -45,14 +45,14 @@ variable "app_version" {
 # --- Official Azure Naming Module ---
 module "naming" {
   source  = "Azure/naming/azurerm"
-  version = "~> 0.4.0" 
+  version = "~> 0.4.0"
   suffix  = [var.workload, var.environment, var.region_abbr, var.instance]
 }
 
 # --- Resource Group ---
 resource "azurerm_resource_group" "main" {
   name     = module.naming.resource_group.name
-  location = "southindia" 
+  location = "southindia"
 }
 
 # --- Virtual Network & Subnets ---
@@ -111,7 +111,7 @@ resource "null_resource" "docker_images" {
   }
 
   provisioner "local-exec" {
-    command = <<-EOT
+    command     = <<-EOT
       set -e
 
       # Login to ACR
@@ -120,6 +120,10 @@ resource "null_resource" "docker_images" {
       # Build and push backend image
       docker build --platform=linux/amd64 -t ${azurerm_container_registry.acr.login_server}/demo-backend:${var.app_version} ./backend
       docker push ${azurerm_container_registry.acr.login_server}/demo-backend:${var.app_version}
+
+      # Build and push aggregator backend image
+      docker build --platform=linux/amd64 -t ${azurerm_container_registry.acr.login_server}/demo-aggregator-backend:${var.app_version} ./aggregator-backend
+      docker push ${azurerm_container_registry.acr.login_server}/demo-aggregator-backend:${var.app_version}
 
       # Build and push frontend image
       docker build --platform=linux/amd64 -t ${azurerm_container_registry.acr.login_server}/demo-frontend:${var.app_version} ./frontend
@@ -133,10 +137,10 @@ resource "null_resource" "docker_images" {
 
 # --- Container App Environment (Private) ---
 resource "azurerm_container_app_environment" "cae" {
-  name                           = module.naming.container_app_environment.name
-  location                       = azurerm_resource_group.main.location
-  resource_group_name            = azurerm_resource_group.main.name
-  
+  name                = module.naming.container_app_environment.name
+  location            = azurerm_resource_group.main.location
+  resource_group_name = azurerm_resource_group.main.name
+
   # Lock it inside the Virtual Network
   infrastructure_subnet_id       = azurerm_subnet.snet_cae.id
   internal_load_balancer_enabled = true
@@ -197,7 +201,54 @@ resource "azurerm_container_app" "backend" {
 
   ingress {
     allow_insecure_connections = true
-    external_enabled = true
+    external_enabled           = false
+    target_port                = 80
+    traffic_weight {
+      percentage      = 100
+      latest_revision = true
+    }
+  }
+}
+
+# --- Container App (Aggregator Backend / Service B) ---
+resource "azurerm_container_app" "aggregator_backend" {
+  name                         = "${module.naming.container_app.name}-aggregator"
+  container_app_environment_id = azurerm_container_app_environment.cae.id
+  resource_group_name          = azurerm_resource_group.main.name
+  revision_mode                = "Single"
+
+  depends_on = [null_resource.docker_images]
+
+  registry {
+    server               = azurerm_container_registry.acr.login_server
+    username             = azurerm_container_registry.acr.admin_username
+    password_secret_name = "acr-password"
+  }
+
+  secret {
+    name  = "acr-password"
+    value = azurerm_container_registry.acr.admin_password
+  }
+
+  template {
+    container {
+      name   = "demo-aggregator-backend"
+      image  = "${azurerm_container_registry.acr.login_server}/demo-aggregator-backend:${var.app_version}"
+      cpu    = 0.25
+      memory = "0.5Gi"
+
+      env {
+        name  = "BACKEND_A_URL"
+        value = "https://${azurerm_container_app.backend.ingress[0].fqdn}"
+      }
+    }
+    min_replicas = 1
+    max_replicas = 1
+  }
+
+  ingress {
+    allow_insecure_connections = true
+    external_enabled           = true
     target_port                = 80
     traffic_weight {
       percentage      = 100
@@ -212,7 +263,7 @@ resource "azurerm_service_plan" "asp" {
   location            = azurerm_resource_group.main.location
   resource_group_name = azurerm_resource_group.main.name
   os_type             = "Linux"
-  sku_name            = "B1" 
+  sku_name            = "B1"
 }
 
 # --- Web App (Frontend) ---
@@ -241,7 +292,7 @@ resource "azurerm_linux_web_app" "frontend" {
   }
 
   app_settings = {
-    "BACKEND_URL"                         = "https://${azurerm_container_app.backend.ingress[0].fqdn}"
+    "BACKEND_URL"                         = "https://${azurerm_container_app.aggregator_backend.ingress[0].fqdn}/api/aggregated-data"
     "WEBSITES_ENABLE_APP_SERVICE_STORAGE" = "false"
   }
 }
@@ -252,10 +303,15 @@ output "acr_login_server" {
 }
 
 output "frontend_url" {
-  value = "https://${azurerm_linux_web_app.frontend.default_hostname}"
+  value = "http://${azurerm_linux_web_app.frontend.default_hostname}"
+}
+
+output "aggregator_backend_url" {
+  value       = "http://${azurerm_container_app.aggregator_backend.ingress[0].fqdn}"
+  description = "Service B endpoint for frontend requests."
 }
 
 output "backend_url" {
-  value = "http://${azurerm_container_app.backend.ingress[0].fqdn}"
-  description = "Note: Because this is now a private backend, this URL will only resolve and work if called from within the VNet."
+  value       = "http://${azurerm_container_app.backend.ingress[0].fqdn}"
+  description = "Note: This existing backend is internal-only and will only resolve from within the private network."
 }
