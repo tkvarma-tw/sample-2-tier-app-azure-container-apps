@@ -7,7 +7,7 @@ const BACKEND_URL = process.env.BACKEND_URL;
 app.get('/', async (req, res) => {
     try {
         // Fetch data from the Azure Container App backend
-        const response = await axios.get(`${BACKEND_URL}/api/data`);
+        const response = await axios.get(`${BACKEND_URL}/api/aggregated-data`);
 
         res.send(`
             <html>

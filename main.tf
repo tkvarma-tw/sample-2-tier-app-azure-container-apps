@@ -8,6 +8,10 @@ terraform {
       source  = "hashicorp/null"
       version = "3.3.0"
     }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.9.0"
+    }
   }
 }
 
@@ -133,6 +137,13 @@ resource "null_resource" "docker_images" {
   }
 
   depends_on = [azurerm_container_registry.acr]
+}
+
+resource "random_string" "frontend_suffix" {
+  length  = 5
+  lower   = true
+  upper   = false
+  special = false
 }
 
 # --- Container App Environment (Private) ---
@@ -268,7 +279,7 @@ resource "azurerm_service_plan" "asp" {
 
 # --- Web App (Frontend) ---
 resource "azurerm_linux_web_app" "frontend" {
-  name                = module.naming.app_service.name
+  name                = "${module.naming.app_service.name}-${random_string.frontend_suffix.result}"
   location            = azurerm_resource_group.main.location
   resource_group_name = azurerm_resource_group.main.name
   service_plan_id     = azurerm_service_plan.asp.id
@@ -292,7 +303,7 @@ resource "azurerm_linux_web_app" "frontend" {
   }
 
   app_settings = {
-    "BACKEND_URL"                         = "https://${azurerm_container_app.aggregator_backend.ingress[0].fqdn}/api/aggregated-data"
+    "BACKEND_URL"                         = "https://${azurerm_container_app.aggregator_backend.ingress[0].fqdn}"
     "WEBSITES_ENABLE_APP_SERVICE_STORAGE" = "false"
   }
 }
