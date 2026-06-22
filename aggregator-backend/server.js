@@ -1,25 +1,27 @@
 const express = require('express');
 const axios = require('axios');
+const { ServiceBusClient } = require('@azure/service-bus');
+const { ManagedIdentityCredential } = require('@azure/identity');
 const app = express();
 
 const PORT = process.env.PORT || 80;
 const BACKEND_A_URL = process.env.BACKEND_A_URL;
-const SERVICEBUS_CONNECTION_STRING = process.env.SERVICEBUS_CONNECTION_STRING;
+const SERVICEBUS_NAMESPACE = process.env.SERVICEBUS_NAMESPACE;
 const SERVICEBUS_TOPIC_NAME = process.env.SERVICEBUS_TOPIC_NAME || 'demo-events';
 
 app.use(express.json());
 
 app.post('/api/publish-event', async (req, res) => {
-    if (!SERVICEBUS_CONNECTION_STRING) {
+    if (!SERVICEBUS_NAMESPACE) {
         return res.status(500).json({
             status: 'Error',
-            message: 'Configuration error: SERVICEBUS_CONNECTION_STRING is missing.'
+            message: 'Configuration error: SERVICEBUS_NAMESPACE is missing.'
         });
     }
 
     try {
-        const { ServiceBusClient } = require('@azure/service-bus');
-        const client = new ServiceBusClient(SERVICEBUS_CONNECTION_STRING);
+        const credential = new ManagedIdentityCredential();
+        const client = new ServiceBusClient(`https://${SERVICEBUS_NAMESPACE}.servicebus.windows.net`, credential);
         const sender = client.createSender(SERVICEBUS_TOPIC_NAME);
 
         const eventPayload = {
