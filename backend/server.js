@@ -1,14 +1,18 @@
 const express = require('express');
 const axios = require('axios');
+const { ServiceBusClient } = require('@azure/service-bus');
 const app = express();
 const PORT = process.env.PORT || 80;
 
-// Public weather API. Swapped from Open-Meteo to MET Norway (api.met.no) to
-// test whether the outbound failure is provider-specific or a general egress
-// black-hole. No API key required, but MET requires a descriptive User-Agent.
 const LATITUDE = process.env.WEATHER_LATITUDE || '17.385';
 const LONGITUDE = process.env.WEATHER_LONGITUDE || '78.4867';
 const WEATHER_URL = `https://api.met.no/weatherapi/locationforecast/2.0/compact?lat=${LATITUDE}&lon=${LONGITUDE}`;
+
+const SERVICEBUS_CONNECTION_STRING = process.env.SERVICEBUS_CONNECTION_STRING;
+const SERVICEBUS_TOPIC_NAME = process.env.SERVICEBUS_TOPIC_NAME || 'demo-events';
+const SERVICEBUS_SUBSCRIPTION_NAME = process.env.SERVICEBUS_SUBSCRIPTION_NAME || 'demo-processor';
+
+const processedEvents = [];
 
 // Map a few common MET Norway symbol_codes to Open-Meteo WMO codes so the
 // frontend's describeWeather() keeps working without changes.
@@ -61,5 +65,41 @@ app.get('/api/data', async (req, res) => {
         });
     }
 });
+
+app.get('/api/event-status', (req, res) => {
+    res.json({
+        status: 'Success',
+        latestProcessedEvent: processedEvents.length ? processedEvents[processedEvents.length - 1] : null,
+        processedCount: processedEvents.length
+    });
+});
+
+function startServiceBusReceiver() {
+    if (!SERVICEBUS_CONNECTION_STRING) {
+        console.error('SERVICEBUS_CONNECTION_STRING is not configured. Event receiver will not start.');
+        return;
+    }
+
+    const client = new ServiceBusClient(SERVICEBUS_CONNECTION_STRING);
+    const receiver = client.createReceiver(SERVICEBUS_TOPIC_NAME, SERVICEBUS_SUBSCRIPTION_NAME);
+
+    receiver.subscribe({
+        processMessage: async (message) => {
+            console.log('Received event:', message.body);
+            const event = {
+                eventId: message.body?.eventId || `event-${Date.now()}`,
+                receivedAt: new Date().toISOString(),
+                status: 'Processed',
+                payload: message.body
+            };
+            processedEvents.push(event);
+        },
+        processError: async (args) => {
+            console.error('Service Bus processing error:', args.error);
+        }
+    }, { autoCompleteMessages: true, maxConcurrentCalls: 1 });
+}
+
+startServiceBusReceiver();
 
 app.listen(PORT, () => console.log(`Backend listening on port ${PORT}`));
