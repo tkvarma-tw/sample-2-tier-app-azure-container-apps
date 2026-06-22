@@ -81,8 +81,11 @@ function startServiceBusReceiver() {
         return;
     }
 
+    console.log('Service Bus receiver: creating credential and client');
     const credential = new ManagedIdentityCredential();
-    const client = new ServiceBusClient(`https://${SERVICEBUS_NAMESPACE}.servicebus.windows.net`, credential);
+    const fullyQualifiedNamespace = `${SERVICEBUS_NAMESPACE}.servicebus.windows.net`;
+    console.log('Service Bus receiver: using namespace', fullyQualifiedNamespace);
+    const client = new ServiceBusClient(fullyQualifiedNamespace, credential);
     const receiver = client.createReceiver(SERVICEBUS_TOPIC_NAME, SERVICEBUS_SUBSCRIPTION_NAME);
 
     receiver.subscribe({
@@ -98,6 +101,13 @@ function startServiceBusReceiver() {
         },
         processError: async (args) => {
             console.error('Service Bus processing error:', args.error);
+            console.error('Service Bus processing error details:', {
+                message: args.error?.message,
+                code: args.error?.code,
+                retryable: args.error?.retryable,
+                info: args.error?.info,
+                innerError: args.error?.innerError || args.error?.details
+            });
         }
     }, { autoCompleteMessages: true, maxConcurrentCalls: 1 });
 }

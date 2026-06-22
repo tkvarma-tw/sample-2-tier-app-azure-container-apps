@@ -20,8 +20,11 @@ app.post('/api/publish-event', async (req, res) => {
     }
 
     try {
+        console.log('Publish event: creating credential and Service Bus client');
         const credential = new ManagedIdentityCredential();
-        const client = new ServiceBusClient(`https://${SERVICEBUS_NAMESPACE}.servicebus.windows.net`, credential);
+        const fullyQualifiedNamespace = `${SERVICEBUS_NAMESPACE}.servicebus.windows.net`;
+        console.log('Publish event: using namespace', fullyQualifiedNamespace);
+        const client = new ServiceBusClient(fullyQualifiedNamespace, credential);
         const sender = client.createSender(SERVICEBUS_TOPIC_NAME);
 
         const eventPayload = {
@@ -31,13 +34,17 @@ app.post('/api/publish-event', async (req, res) => {
             details: req.body.details || 'POC event from the aggregator backend'
         };
 
+        console.log('Publish event: sending message to', SERVICEBUS_NAMESPACE, SERVICEBUS_TOPIC_NAME);
         await sender.sendMessages({
             body: eventPayload,
             contentType: 'application/json',
             subject: 'demo-event'
         });
+        console.log('Publish event: message sent successfully');
+
         await sender.close();
         await client.close();
+        console.log('Publish event: Service Bus client closed');
 
         res.json({
             status: 'Success',
@@ -45,10 +52,20 @@ app.post('/api/publish-event', async (req, res) => {
             event: eventPayload
         });
     } catch (error) {
+        console.error('Publish event failed:', error);
+        console.error('Publish event error details:', {
+            message: error.message,
+            code: error.code,
+            retryable: error.retryable,
+            info: error.info,
+            innerError: error.innerError || error.details
+        });
         res.status(500).json({
             status: 'Error',
             message: 'Failed to publish event to Service Bus.',
-            error: error.message
+            error: error.message,
+            code: error.code,
+            retryable: error.retryable
         });
     }
 });

@@ -110,6 +110,14 @@ resource "azurerm_subnet" "snet_cae" {
   }
 }
 
+# --- Private Subnet for Service Bus Private Endpoint ---
+resource "azurerm_subnet" "snet_private_endpoint" {
+  name                 = "snet-pe"
+  resource_group_name  = azurerm_resource_group.main.name
+  virtual_network_name = azurerm_virtual_network.vnet.name
+  address_prefixes     = ["10.0.0.0/24"]
+}
+
 # --- NAT Gateway (deterministic outbound egress for the backend) ---
 # Associated with snet_cae so the Container App backend's outbound traffic
 # (to the public weather API) leaves the VNet through a single static IP.
@@ -234,6 +242,10 @@ resource "azurerm_container_app" "backend" {
   resource_group_name          = azurerm_resource_group.main.name
   revision_mode                = "Single"
 
+  identity {
+    type = "SystemAssigned"
+  }
+
   # Crucial: Wait for the images to be pushed before deploying
   depends_on = [null_resource.docker_images]
 
@@ -262,6 +274,18 @@ resource "azurerm_container_app" "backend" {
         name  = "WEATHER_LONGITUDE"
         value = var.weather_longitude
       }
+      env {
+        name  = "SERVICEBUS_NAMESPACE"
+        value = azurerm_servicebus_namespace.main.name
+      }
+      env {
+        name  = "SERVICEBUS_TOPIC_NAME"
+        value = azurerm_servicebus_topic.demo_events.name
+      }
+      env {
+        name  = "SERVICEBUS_SUBSCRIPTION_NAME"
+        value = azurerm_servicebus_subscription.demo_processor.name
+      }
     }
 
     min_replicas = 1
@@ -285,6 +309,10 @@ resource "azurerm_container_app" "aggregator_backend" {
   container_app_environment_id = azurerm_container_app_environment.cae.id
   resource_group_name          = azurerm_resource_group.main.name
   revision_mode                = "Single"
+
+  identity {
+    type = "SystemAssigned"
+  }
 
   depends_on = [null_resource.docker_images]
 
@@ -310,6 +338,14 @@ resource "azurerm_container_app" "aggregator_backend" {
         name  = "BACKEND_A_URL"
         value = "https://${azurerm_container_app.backend.ingress[0].fqdn}"
       }
+      env {
+        name  = "SERVICEBUS_NAMESPACE"
+        value = azurerm_servicebus_namespace.main.name
+      }
+      env {
+        name  = "SERVICEBUS_TOPIC_NAME"
+        value = azurerm_servicebus_topic.demo_events.name
+      }
     }
     min_replicas = 1
     max_replicas = 1
@@ -324,6 +360,82 @@ resource "azurerm_container_app" "aggregator_backend" {
       latest_revision = true
     }
   }
+}
+
+# --- Service Bus Namespace ---
+resource "azurerm_servicebus_namespace" "main" {
+   name                          = module.naming.servicebus_namespace.name
+  location                      = azurerm_resource_group.main.location
+  resource_group_name           = azurerm_resource_group.main.name
+  sku                           = "Premium"
+  capacity                      = 1
+  premium_messaging_partitions  = 1
+}
+
+# --- Service Bus Topic ---
+resource "azurerm_servicebus_topic" "demo_events" {
+  name         = module.naming.servicebus_topic.name
+  namespace_id = azurerm_servicebus_namespace.main.id
+}
+
+# --- Service Bus Subscription ---
+resource "azurerm_servicebus_subscription" "demo_processor" {
+  name               = "${module.naming.servicebus_topic.name}-subscription"
+  topic_id           = azurerm_servicebus_topic.demo_events.id
+  max_delivery_count = 10
+}
+
+# --- Service Bus Private Endpoint ---
+resource "azurerm_private_endpoint" "servicebus" {
+  name                = "${module.naming.private_endpoint.name}-sb"
+  location            = azurerm_resource_group.main.location
+  resource_group_name = azurerm_resource_group.main.name
+  subnet_id           = azurerm_subnet.snet_private_endpoint.id
+
+  private_service_connection {
+    name                           = "${module.naming.private_service_connection.name}-sb"
+    private_connection_resource_id = azurerm_servicebus_namespace.main.id
+    subresource_names              = ["namespace"]
+    is_manual_connection           = false
+  }
+}
+
+# --- Private DNS Zone for Service Bus ---
+resource "azurerm_private_dns_zone" "servicebus" {
+  name                = "privatelink.servicebus.windows.net"
+  resource_group_name = azurerm_resource_group.main.name
+}
+
+# --- Link Private DNS Zone to VNet ---
+resource "azurerm_private_dns_zone_virtual_network_link" "servicebus_vnet_link" {
+  name                  = "servicebus-vnet-link"
+  resource_group_name   = azurerm_resource_group.main.name
+  private_dns_zone_name = azurerm_private_dns_zone.servicebus.name
+  virtual_network_id    = azurerm_virtual_network.vnet.id
+  registration_enabled  = false
+}
+
+# --- Private DNS A Record for Service Bus ---
+resource "azurerm_private_dns_a_record" "servicebus" {
+  name                = azurerm_servicebus_namespace.main.name
+  zone_name           = azurerm_private_dns_zone.servicebus.name
+  resource_group_name = azurerm_resource_group.main.name
+  ttl                 = 300
+  records             = [azurerm_private_endpoint.servicebus.private_service_connection[0].private_ip_address]
+}
+
+# --- Role Assignment: Aggregator Backend - Service Bus Data Sender ---
+resource "azurerm_role_assignment" "aggregator_backend_sender" {
+  scope              = azurerm_servicebus_namespace.main.id
+  role_definition_name = "Azure Service Bus Data Sender"
+  principal_id       = azurerm_container_app.aggregator_backend.identity[0].principal_id
+}
+
+# --- Role Assignment: Backend - Service Bus Data Receiver ---
+resource "azurerm_role_assignment" "backend_receiver" {
+  scope              = azurerm_servicebus_namespace.main.id
+  role_definition_name = "Azure Service Bus Data Receiver"
+  principal_id       = azurerm_container_app.backend.identity[0].principal_id
 }
 
 # --- App Service Plan ---
@@ -388,4 +500,24 @@ output "backend_url" {
 output "nat_egress_ip" {
   value       = azurerm_public_ip.nat.ip_address
   description = "Static public IP the backend uses to reach the public weather API via the NAT Gateway."
+}
+
+output "servicebus_namespace_name" {
+  value       = azurerm_servicebus_namespace.main.name
+  description = "Service Bus namespace name for use with managed identity authentication."
+}
+
+output "servicebus_namespace_id" {
+  value       = azurerm_servicebus_namespace.main.id
+  description = "Service Bus namespace resource ID."
+}
+
+output "servicebus_private_endpoint_ip" {
+  value       = azurerm_private_endpoint.servicebus.private_service_connection[0].private_ip_address
+  description = "Private IP address of the Service Bus private endpoint."
+}
+
+output "private_dns_zone_id" {
+  value       = azurerm_private_dns_zone.servicebus.id
+  description = "Private DNS zone ID for Service Bus (privatelink.servicebus.windows.net)."
 }
