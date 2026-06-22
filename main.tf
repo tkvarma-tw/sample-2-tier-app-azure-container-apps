@@ -46,6 +46,19 @@ variable "app_version" {
   description = "The image tag used for both the frontend and backend Docker containers"
 }
 
+variable "weather_latitude" {
+  type        = string
+  default     = "17.385"
+  description = "Latitude the backend uses to query the public weather API (default: Hyderabad)"
+}
+
+variable "weather_longitude" {
+  type        = string
+  default     = "78.4867"
+  description = "Longitude the backend uses to query the public weather API (default: Hyderabad)"
+}
+
+
 # --- Official Azure Naming Module ---
 module "naming" {
   source  = "Azure/naming/azurerm"
@@ -95,6 +108,34 @@ resource "azurerm_subnet" "snet_cae" {
       actions = ["Microsoft.Network/virtualNetworks/subnets/join/action"]
     }
   }
+}
+
+# --- NAT Gateway (deterministic outbound egress for the backend) ---
+# Associated with snet_cae so the Container App backend's outbound traffic
+# (to the public weather API) leaves the VNet through a single static IP.
+resource "azurerm_public_ip" "nat" {
+  name                = module.naming.public_ip.name
+  location            = azurerm_resource_group.main.location
+  resource_group_name = azurerm_resource_group.main.name
+  allocation_method   = "Static"
+  sku                 = "Standard"
+}
+
+resource "azurerm_nat_gateway" "nat" {
+  name                = module.naming.nat_gateway.name
+  location            = azurerm_resource_group.main.location
+  resource_group_name = azurerm_resource_group.main.name
+  sku_name            = "Standard"
+}
+
+resource "azurerm_nat_gateway_public_ip_association" "nat" {
+  nat_gateway_id       = azurerm_nat_gateway.nat.id
+  public_ip_address_id = azurerm_public_ip.nat.id
+}
+
+resource "azurerm_subnet_nat_gateway_association" "cae" {
+  subnet_id      = azurerm_subnet.snet_cae.id
+  nat_gateway_id = azurerm_nat_gateway.nat.id
 }
 
 # --- Azure Container Registry ---
@@ -155,6 +196,14 @@ resource "azurerm_container_app_environment" "cae" {
   # Lock it inside the Virtual Network
   infrastructure_subnet_id       = azurerm_subnet.snet_cae.id
   internal_load_balancer_enabled = true
+
+  # NAT Gateway egress requires a workload profiles environment (not Consumption-only).
+  workload_profile {
+    name                  = "Consumption"
+    workload_profile_type = "Consumption"
+  }
+
+  depends_on = [azurerm_subnet_nat_gateway_association.cae]
 }
 
 # --- Private DNS Zone for CAE ---
@@ -205,7 +254,16 @@ resource "azurerm_container_app" "backend" {
       image  = "${azurerm_container_registry.acr.login_server}/demo-backend:${var.app_version}"
       cpu    = 0.25
       memory = "0.5Gi"
+      env {
+        name  = "WEATHER_LATITUDE"
+        value = var.weather_latitude
+      }
+      env {
+        name  = "WEATHER_LONGITUDE"
+        value = var.weather_longitude
+      }
     }
+    
     min_replicas = 1
     max_replicas = 1
   }
@@ -325,4 +383,9 @@ output "aggregator_backend_url" {
 output "backend_url" {
   value       = "http://${azurerm_container_app.backend.ingress[0].fqdn}"
   description = "Note: This existing backend is internal-only and will only resolve from within the private network."
+}
+
+output "nat_egress_ip" {
+  value       = azurerm_public_ip.nat.ip_address
+  description = "Static public IP the backend uses to reach the public weather API via the NAT Gateway."
 }
