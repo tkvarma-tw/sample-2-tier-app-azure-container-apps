@@ -4,7 +4,7 @@ FROM node:20-alpine
 # 2. Create and set the app directory inside the container
 WORKDIR /app
 
-RUN npm install express axios
+RUN npm install express axios @azure/service-bus @azure/identity
 
 # 4. Copy the rest of your application code
 COPY server.js .

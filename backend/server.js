@@ -1,14 +1,19 @@
 const express = require('express');
 const axios = require('axios');
+const { ServiceBusClient } = require('@azure/service-bus');
+const { ManagedIdentityCredential } = require('@azure/identity');
 const app = express();
 const PORT = process.env.PORT || 80;
 
-// Public weather API. Swapped from Open-Meteo to MET Norway (api.met.no) to
-// test whether the outbound failure is provider-specific or a general egress
-// black-hole. No API key required, but MET requires a descriptive User-Agent.
 const LATITUDE = process.env.WEATHER_LATITUDE || '17.385';
 const LONGITUDE = process.env.WEATHER_LONGITUDE || '78.4867';
 const WEATHER_URL = `https://api.met.no/weatherapi/locationforecast/2.0/compact?lat=${LATITUDE}&lon=${LONGITUDE}`;
+
+const SERVICEBUS_NAMESPACE = process.env.SERVICEBUS_NAMESPACE;
+const SERVICEBUS_TOPIC_NAME = process.env.SERVICEBUS_TOPIC_NAME || 'demo-events';
+const SERVICEBUS_SUBSCRIPTION_NAME = process.env.SERVICEBUS_SUBSCRIPTION_NAME || 'demo-processor';
+
+const processedEvents = [];
 
 // Map a few common MET Norway symbol_codes to Open-Meteo WMO codes so the
 // frontend's describeWeather() keeps working without changes.
@@ -61,5 +66,52 @@ app.get('/api/data', async (req, res) => {
         });
     }
 });
+
+app.get('/api/event-status', (req, res) => {
+    res.json({
+        status: 'Success',
+        latestProcessedEvent: processedEvents.length ? processedEvents[processedEvents.length - 1] : null,
+        processedCount: processedEvents.length
+    });
+});
+
+function startServiceBusReceiver() {
+    if (!SERVICEBUS_NAMESPACE) {
+        console.error('SERVICEBUS_NAMESPACE is not configured. Event receiver will not start.');
+        return;
+    }
+
+    console.log('Service Bus receiver: creating credential and client');
+    const credential = new ManagedIdentityCredential();
+    const fullyQualifiedNamespace = `${SERVICEBUS_NAMESPACE}.servicebus.windows.net`;
+    console.log('Service Bus receiver: using namespace', fullyQualifiedNamespace);
+    const client = new ServiceBusClient(fullyQualifiedNamespace, credential);
+    const receiver = client.createReceiver(SERVICEBUS_TOPIC_NAME, SERVICEBUS_SUBSCRIPTION_NAME);
+
+    receiver.subscribe({
+        processMessage: async (message) => {
+            console.log('Received event:', message.body);
+            const event = {
+                eventId: message.body?.eventId || `event-${Date.now()}`,
+                receivedAt: new Date().toISOString(),
+                status: 'Processed',
+                payload: message.body
+            };
+            processedEvents.push(event);
+        },
+        processError: async (args) => {
+            console.error('Service Bus processing error:', args.error);
+            console.error('Service Bus processing error details:', {
+                message: args.error?.message,
+                code: args.error?.code,
+                retryable: args.error?.retryable,
+                info: args.error?.info,
+                innerError: args.error?.innerError || args.error?.details
+            });
+        }
+    }, { autoCompleteMessages: true, maxConcurrentCalls: 1 });
+}
+
+startServiceBusReceiver();
 
 app.listen(PORT, () => console.log(`Backend listening on port ${PORT}`));
