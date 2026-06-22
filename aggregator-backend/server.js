@@ -21,13 +21,15 @@ app.get('/api/aggregated-data', async (req, res) => {
     try {
         // Calling the existing backend microservice
         const response = await axios.get(`${BACKEND_A_URL}/api/data`, { timeout: 5000 });
+        const upstream = response.data;
         
-        // Combine data from the existing backend with data from this new service
+        // Preserve the original backend payload while also adding service B metadata.
         res.json({
             status: "Success",
             source: "New Backend Service (B)",
             newData: "This is extra data processed by Service B.",
-            upstreamData: response.data
+            ...upstream,
+            upstreamData: upstream
         });
 
     } catch (error) {
