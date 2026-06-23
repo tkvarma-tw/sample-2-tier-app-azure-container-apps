@@ -522,7 +522,7 @@ resource "azurerm_web_application_firewall_policy" "res-0" {
 }
 
 resource "azurerm_public_ip" "apgw" {
-  name                = "${module.naming.public_ip.name}-02"      #TODO will check tomorrow
+  name                = "${module.naming.public_ip.name}-02"
   location            = azurerm_resource_group.main.location
   resource_group_name = azurerm_resource_group.main.name
   allocation_method   = "Static"
