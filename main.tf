@@ -378,12 +378,12 @@ resource "azurerm_container_app" "aggregator_backend" {
 
 # --- Service Bus Namespace ---
 resource "azurerm_servicebus_namespace" "main" {
-   name                          = module.naming.servicebus_namespace.name
-  location                      = azurerm_resource_group.main.location
-  resource_group_name           = azurerm_resource_group.main.name
-  sku                           = "Premium"
-  capacity                      = 1
-  premium_messaging_partitions  = 1
+  name                         = module.naming.servicebus_namespace.name
+  location                     = azurerm_resource_group.main.location
+  resource_group_name          = azurerm_resource_group.main.name
+  sku                          = "Premium"
+  capacity                     = 1
+  premium_messaging_partitions = 1
 }
 
 # --- Service Bus Topic ---
@@ -440,16 +440,16 @@ resource "azurerm_private_dns_a_record" "servicebus" {
 
 # --- Role Assignment: Aggregator Backend - Service Bus Data Sender ---
 resource "azurerm_role_assignment" "aggregator_backend_sender" {
-  scope              = azurerm_servicebus_namespace.main.id
+  scope                = azurerm_servicebus_namespace.main.id
   role_definition_name = "Azure Service Bus Data Sender"
-  principal_id       = azurerm_container_app.aggregator_backend.identity[0].principal_id
+  principal_id         = azurerm_container_app.aggregator_backend.identity[0].principal_id
 }
 
 # --- Role Assignment: Backend - Service Bus Data Receiver ---
 resource "azurerm_role_assignment" "backend_receiver" {
-  scope              = azurerm_servicebus_namespace.main.id
+  scope                = azurerm_servicebus_namespace.main.id
   role_definition_name = "Azure Service Bus Data Receiver"
-  principal_id       = azurerm_container_app.backend.identity[0].principal_id
+  principal_id         = azurerm_container_app.backend.identity[0].principal_id
 }
 
 # --- App Service Plan ---
@@ -509,15 +509,12 @@ resource "azurerm_web_application_firewall_policy" "res-0" {
     }
   }
   policy_settings {
-    enabled                                   = true
-    file_upload_enforcement                   = true
-    file_upload_limit_in_mb                   = 100
-    js_challenge_cookie_expiration_in_minutes = 30
-    max_request_body_size_in_kb               = 128
-    mode                                      = "Detection"
-    request_body_check                        = true
-    request_body_enforcement                  = true
-    request_body_inspect_limit_in_kb          = 128
+    enabled                          = true
+    file_upload_limit_in_mb          = 100
+    max_request_body_size_in_kb      = 128
+    mode                             = "Detection"
+    request_body_check               = true
+    request_body_inspect_limit_in_kb = 128
   }
 }
 
@@ -531,12 +528,11 @@ resource "azurerm_public_ip" "apgw" {
 
 
 resource "azurerm_application_gateway" "res-0" {
-  enable_http2                      = true
-  fips_enabled                      = false
-  firewall_policy_id                = azurerm_web_application_firewall_policy.res-0.id
+  enable_http2       = true
+  fips_enabled       = false
+  firewall_policy_id = azurerm_web_application_firewall_policy.res-0.id
   # firewall_policy_id                = "/subscriptions/bf64dbbf-7dac-472e-92ca-6ee6c08d1055/resourceGroups/rg-howden-dev-ins-01/providers/Microsoft.Network/applicationGatewayWebApplicationFirewallPolicies/wafhowdendevins01"
   force_firewall_policy_association = false
-  http2_enabled                     = true
   location                          = azurerm_resource_group.main.location
   name                              = module.naming.application_gateway.name
   resource_group_name               = azurerm_resource_group.main.name
@@ -550,7 +546,6 @@ resource "azurerm_application_gateway" "res-0" {
   backend_http_settings {
     affinity_cookie_name                 = ""
     cookie_based_affinity                = "Disabled"
-    dedicated_backend_connection_enabled = false
     host_name                            = ""
     name                                 = "backend-settings-${var.instance}"
     path                                 = ""
@@ -568,7 +563,7 @@ resource "azurerm_application_gateway" "res-0" {
     private_link_configuration_name = ""
     public_ip_address_id            = azurerm_public_ip.apgw.id
     # public_ip_address_id            = "/subscriptions/bf64dbbf-7dac-472e-92ca-6ee6c08d1055/resourceGroups/rg-howden-dev-ins-01/providers/Microsoft.Network/publicIPAddresses/pip-howden-dev-ins-02"
-    subnet_id                       = ""
+    subnet_id = ""
   }
   frontend_port {
     name = "port_80"
