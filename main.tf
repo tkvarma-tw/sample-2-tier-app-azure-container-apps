@@ -544,11 +544,8 @@ resource "azurerm_application_gateway" "res-0" {
     name         = "backend-pool-webapp-${var.instance}"
   }
   backend_http_settings {
-    affinity_cookie_name                 = ""
     cookie_based_affinity                = "Disabled"
-    host_name                            = ""
     name                                 = "backend-settings-${var.instance}"
-    path                                 = ""
     pick_host_name_from_backend_address  = true
     port                                 = 80
     probe_name                           = "healthprobe${var.instance}"
@@ -575,30 +572,22 @@ resource "azurerm_application_gateway" "res-0" {
     # subnet_id = "/subscriptions/bf64dbbf-7dac-472e-92ca-6ee6c08d1055/resourceGroups/rg-howden-dev-ins-01/providers/Microsoft.Network/virtualNetworks/vnet-howden-dev-ins-01/subnets/snet-appgateway"
   }
   http_listener {
-    firewall_policy_id             = ""
     frontend_ip_configuration_name = "appGwPublicFrontendIpIPv4"
     frontend_port_name             = "port_80"
-    host_name                      = ""
-    host_names                     = []
     name                           = "Listener${var.instance}"
     protocol                       = "Http"
     require_sni                    = false
-    ssl_certificate_name           = ""
-    ssl_profile_name               = ""
   }
   probe {
-    host                                      = ""
     interval                                  = 30
     minimum_servers                           = 0
     name                                      = "healthprobe${var.instance}"
     path                                      = "/health"
     pick_host_name_from_backend_http_settings = true
-    port                                      = 0
     protocol                                  = "Http"
     timeout                                   = 30
     unhealthy_threshold                       = 3
     match {
-      body        = ""
       status_code = ["200-399"]
     }
   }
@@ -608,10 +597,7 @@ resource "azurerm_application_gateway" "res-0" {
     http_listener_name          = "Listener${var.instance}"
     name                        = "Rule${var.instance}"
     priority                    = 1
-    redirect_configuration_name = ""
-    rewrite_rule_set_name       = ""
     rule_type                   = "Basic"
-    url_path_map_name           = ""
   }
   sku {
     capacity = 1
