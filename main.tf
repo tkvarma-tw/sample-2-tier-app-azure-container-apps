@@ -110,6 +110,20 @@ resource "azurerm_subnet" "snet_cae" {
   }
 }
 
+resource "azurerm_subnet" "snet_apim" {
+  name                 = "snet-apim"
+  resource_group_name  = azurerm_resource_group.main.name
+  virtual_network_name = azurerm_virtual_network.vnet.name
+  address_prefixes     = ["10.0.5.0/24"]
+}
+
+resource "azurerm_subnet" "snet_appgateway" {
+  name                 = "snet-appgateway"
+  resource_group_name  = azurerm_resource_group.main.name
+  virtual_network_name = azurerm_virtual_network.vnet.name
+  address_prefixes     = ["10.0.4.0/24"]
+}
+
 # --- Private Subnet for Service Bus Private Endpoint ---
 resource "azurerm_subnet" "snet_private_endpoint" {
   name                 = "snet-pe"
@@ -464,6 +478,11 @@ resource "azurerm_linux_web_app" "frontend" {
     # Force traffic to use Private DNS for resolution
     vnet_route_all_enabled = true
 
+    # --- HEALTH PROBE CONFIGURATION ---
+    health_check_path                 = "/health"
+    health_check_eviction_time_in_min = 2
+    # ----------------------------------
+
     application_stack {
       docker_image_name        = "demo-frontend:${var.app_version}"
       docker_registry_url      = "https://${azurerm_container_registry.acr.login_server}"
@@ -475,6 +494,134 @@ resource "azurerm_linux_web_app" "frontend" {
   app_settings = {
     "BACKEND_URL"                         = "https://${azurerm_container_app.aggregator_backend.ingress[0].fqdn}"
     "WEBSITES_ENABLE_APP_SERVICE_STORAGE" = "false"
+  }
+}
+
+resource "azurerm_web_application_firewall_policy" "res-0" {
+  location            = azurerm_resource_group.main.location
+  name                = module.naming.web_application_firewall_policy.name
+  resource_group_name = azurerm_resource_group.main.name
+  tags                = {}
+  managed_rules {
+    managed_rule_set {
+      type    = "OWASP"
+      version = "3.2"
+    }
+  }
+  policy_settings {
+    enabled                                   = true
+    file_upload_enforcement                   = true
+    file_upload_limit_in_mb                   = 100
+    js_challenge_cookie_expiration_in_minutes = 30
+    max_request_body_size_in_kb               = 128
+    mode                                      = "Detection"
+    request_body_check                        = true
+    request_body_enforcement                  = true
+    request_body_inspect_limit_in_kb          = 128
+  }
+}
+
+resource "azurerm_public_ip" "apgw" {
+  name                = "${module.naming.public_ip.name}-02"      #TODO will check tomorrow
+  location            = azurerm_resource_group.main.location
+  resource_group_name = azurerm_resource_group.main.name
+  allocation_method   = "Static"
+  sku                 = "Standard"
+}
+
+
+resource "azurerm_application_gateway" "res-0" {
+  enable_http2                      = true
+  fips_enabled                      = false
+  firewall_policy_id                = azurerm_web_application_firewall_policy.res-0.id
+  # firewall_policy_id                = "/subscriptions/bf64dbbf-7dac-472e-92ca-6ee6c08d1055/resourceGroups/rg-howden-dev-ins-01/providers/Microsoft.Network/applicationGatewayWebApplicationFirewallPolicies/wafhowdendevins01"
+  force_firewall_policy_association = false
+  http2_enabled                     = true
+  location                          = azurerm_resource_group.main.location
+  name                              = module.naming.application_gateway.name
+  resource_group_name               = azurerm_resource_group.main.name
+  tags                              = {}
+  zones                             = []
+  backend_address_pool {
+    fqdns        = [azurerm_linux_web_app.frontend.default_hostname] #TODO Will check tomorrow
+    ip_addresses = []
+    name         = "backend-pool-webapp-${var.instance}"
+  }
+  backend_http_settings {
+    affinity_cookie_name                 = ""
+    cookie_based_affinity                = "Disabled"
+    dedicated_backend_connection_enabled = false
+    host_name                            = ""
+    name                                 = "backend-settings-${var.instance}"
+    path                                 = ""
+    pick_host_name_from_backend_address  = true
+    port                                 = 80
+    probe_name                           = "healthprobe${var.instance}"
+    protocol                             = "Http"
+    request_timeout                      = 20
+    trusted_root_certificate_names       = []
+  }
+  frontend_ip_configuration {
+    name                            = "appGwPublicFrontendIpIPv4"
+    private_ip_address              = ""
+    private_ip_address_allocation   = "Dynamic"
+    private_link_configuration_name = ""
+    public_ip_address_id            = azurerm_public_ip.apgw.id
+    # public_ip_address_id            = "/subscriptions/bf64dbbf-7dac-472e-92ca-6ee6c08d1055/resourceGroups/rg-howden-dev-ins-01/providers/Microsoft.Network/publicIPAddresses/pip-howden-dev-ins-02"
+    subnet_id                       = ""
+  }
+  frontend_port {
+    name = "port_80"
+    port = 80
+  }
+  gateway_ip_configuration {
+    name      = "appGatewayIpConfig"
+    subnet_id = azurerm_subnet.snet_appgateway.id
+    # subnet_id = "/subscriptions/bf64dbbf-7dac-472e-92ca-6ee6c08d1055/resourceGroups/rg-howden-dev-ins-01/providers/Microsoft.Network/virtualNetworks/vnet-howden-dev-ins-01/subnets/snet-appgateway"
+  }
+  http_listener {
+    firewall_policy_id             = ""
+    frontend_ip_configuration_name = "appGwPublicFrontendIpIPv4"
+    frontend_port_name             = "port_80"
+    host_name                      = ""
+    host_names                     = []
+    name                           = "Listener${var.instance}"
+    protocol                       = "Http"
+    require_sni                    = false
+    ssl_certificate_name           = ""
+    ssl_profile_name               = ""
+  }
+  probe {
+    host                                      = ""
+    interval                                  = 30
+    minimum_servers                           = 0
+    name                                      = "healthprobe${var.instance}"
+    path                                      = "/health"
+    pick_host_name_from_backend_http_settings = true
+    port                                      = 0
+    protocol                                  = "Http"
+    timeout                                   = 30
+    unhealthy_threshold                       = 3
+    match {
+      body        = ""
+      status_code = ["200-399"]
+    }
+  }
+  request_routing_rule {
+    backend_address_pool_name   = "backend-pool-webapp-${var.instance}"
+    backend_http_settings_name  = "backend-settings-${var.instance}"
+    http_listener_name          = "Listener${var.instance}"
+    name                        = "Rule${var.instance}"
+    priority                    = 1
+    redirect_configuration_name = ""
+    rewrite_rule_set_name       = ""
+    rule_type                   = "Basic"
+    url_path_map_name           = ""
+  }
+  sku {
+    capacity = 1
+    name     = "WAF_v2"
+    tier     = "WAF_v2"
   }
 }
 

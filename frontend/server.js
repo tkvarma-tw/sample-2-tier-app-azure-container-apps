@@ -18,6 +18,16 @@ function describeWeather(code) {
 
 app.use(express.json());
 
+// --- HEALTH PROBE ENDPOINT ---
+app.get('/health', (req, res) => {
+    // A simple 200 OK response to indicate the service is running
+    res.status(200).json({ 
+        status: 'Healthy', 
+        timestamp: new Date().toISOString() 
+    });
+});
+// -----------------------------
+
 app.post('/api/publish-event', async (req, res) => {
     try {
         const response = await axios.post(`${BACKEND_URL}/api/publish-event`, {
