@@ -37,7 +37,7 @@ variable "region_abbr" {
 
 variable "instance" {
   type    = string
-  default = "01"
+  default = "02"
 }
 
 variable "app_version" {
@@ -595,7 +595,7 @@ resource "azurerm_api_management" "apim" {
 
 # --- Public IP for APIM Management (Required for stv2 platform) ---
 resource "azurerm_public_ip" "apim" {
-  name                = "${module.naming.public_ip.name}-apim02"
+  name                = "${module.naming.public_ip.name}-apim"
   location            = azurerm_resource_group.main.location
   resource_group_name = azurerm_resource_group.main.name
   allocation_method   = "Static"
@@ -702,7 +702,7 @@ resource "azurerm_web_application_firewall_policy" "res-0" {
 }
 
 resource "azurerm_public_ip" "apgw" {
-  name                = "${module.naming.public_ip.name}-02"
+  name                = "${module.naming.public_ip.name}-apgw"
   location            = azurerm_resource_group.main.location
   resource_group_name = azurerm_resource_group.main.name
   allocation_method   = "Static"
