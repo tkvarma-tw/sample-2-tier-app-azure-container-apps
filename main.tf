@@ -2,7 +2,7 @@ terraform {
   required_providers {
     azurerm = {
       source  = "hashicorp/azurerm"
-      version = "~> 4.80.0"
+      version = "~> 4.70.0"
     }
     null = {
       source  = "hashicorp/null"
@@ -122,7 +122,7 @@ resource "azurerm_subnet" "snet_apim" {
 # endpoint (3443) open from the ApiManagement service tag and the infra
 # load balancer (6390). Default NSG rules cover everything else.
 resource "azurerm_network_security_group" "apim" {
-  name                = "${module.naming.network_security_group.name}-apim"
+  name                = module.naming.network_security_group.name
   location            = azurerm_resource_group.main.location
   resource_group_name = azurerm_resource_group.main.name
 
@@ -568,12 +568,24 @@ resource "azurerm_api_management" "apim" {
     subnet_id = azurerm_subnet.snet_apim.id
   }
 
+  public_ip_address_id = azurerm_public_ip.apim.id
+
   identity {
     type = "SystemAssigned"
   }
 
   # NSG must be in place before APIM is injected into the subnet.
   depends_on = [azurerm_subnet_network_security_group_association.apim]
+}
+
+# --- Public IP for APIM Management (Required for stv2 platform) ---
+resource "azurerm_public_ip" "apim" {
+  name                = "${module.naming.public_ip.name}-apim"
+  location            = azurerm_resource_group.main.location
+  resource_group_name = azurerm_resource_group.main.name
+  allocation_method   = "Static"
+  sku                 = "Standard"
+  domain_name_label   = "mgmt-${module.naming.api_management.name}"
 }
 
 # --- APIM API: forwards the frontend's calls to the (internal) Aggregator ---
@@ -683,6 +695,7 @@ resource "azurerm_public_ip" "apgw" {
 }
 
 
+
 resource "azurerm_application_gateway" "res-0" {
   enable_http2       = true
   fips_enabled       = false
@@ -720,8 +733,6 @@ resource "azurerm_application_gateway" "res-0" {
     private_ip_address_allocation   = "Dynamic"
     private_link_configuration_name = ""
     public_ip_address_id            = azurerm_public_ip.apgw.id
-    # public_ip_address_id            = "/subscriptions/bf64dbbf-7dac-472e-92ca-6ee6c08d1055/resourceGroups/rg-howden-dev-ins-01/providers/Microsoft.Network/publicIPAddresses/pip-howden-dev-ins-02"
-    subnet_id = azurerm_subnet.snet_appgateway.id
   }
   frontend_port {
     name = "port_80"
