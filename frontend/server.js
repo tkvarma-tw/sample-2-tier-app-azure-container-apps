@@ -54,6 +54,13 @@ app.get('/', async (req, res) => {
         const data = response.data;
         const w = data.weather || {};
 
+        // APIM stamps this response header via an outbound policy; the aggregator
+        // never sets it, so its presence proves the call traversed APIM.
+        const apimName = response.headers['x-served-via-apim'];
+        const apimBadge = apimName
+            ? `<p style="color:#15803d;">✅ Routed through Azure APIM: <code style="background:#e2e8f0; padding:2px 6px;">${apimName}</code></p>`
+            : `<p style="color:#b45309;">⚠️ APIM marker header not present — request may not have traversed APIM.</p>`;
+
         res.send(`
             <html>
             <body style="font-family: Arial, sans-serif; margin: 40px; text-align: center;">
@@ -62,6 +69,7 @@ app.get('/', async (req, res) => {
                     <div style="border: 2px solid #22c55e; padding: 20px; border-radius: 8px; background-color: #f0fdf4; max-width: 540px; text-align: left;">
                         <h2 style="color: #15803d; margin-top: 0;">✅ Connected to Backend</h2>
                         <p><strong>Frontend fetched data from:</strong> <code style="background: #e2e8f0; padding: 2px 6px;">${BACKEND_URL}</code></p>
+                        ${apimBadge}
                         <p style="color: #15803d;">${data.message || ''}</p>
                     </div>
 

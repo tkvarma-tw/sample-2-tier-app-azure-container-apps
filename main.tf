@@ -631,6 +631,28 @@ resource "azurerm_api_management_api_operation" "aggregated_data" {
   }
 }
 
+# --- APIM policy: stamp a response header so the demo can prove traffic
+# actually passed through APIM (the aggregator never sets this header). ---
+resource "azurerm_api_management_api_policy" "aggregator" {
+  api_name            = azurerm_api_management_api.aggregator.name
+  api_management_name = azurerm_api_management.apim.name
+  resource_group_name = azurerm_resource_group.main.name
+
+  xml_content = <<XML
+<policies>
+  <inbound><base /></inbound>
+  <backend><base /></backend>
+  <outbound>
+    <base />
+    <set-header name="X-Served-Via-APIM" exists-action="override">
+      <value>@(context.Deployment.ServiceName)</value>
+    </set-header>
+  </outbound>
+  <on-error><base /></on-error>
+</policies>
+XML
+}
+
 resource "azurerm_web_application_firewall_policy" "res-0" {
   location            = azurerm_resource_group.main.location
   name                = module.naming.web_application_firewall_policy.name
