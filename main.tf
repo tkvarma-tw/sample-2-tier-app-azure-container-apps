@@ -37,7 +37,7 @@ variable "region_abbr" {
 
 variable "instance" {
   type    = string
-  default = "01"
+  default = "02"
 }
 
 variable "app_version" {
@@ -260,6 +260,9 @@ resource "azurerm_container_app_environment" "cae" {
   infrastructure_subnet_id       = azurerm_subnet.snet_cae.id
   internal_load_balancer_enabled = true
 
+  # Explicitly define the name Azure created
+  infrastructure_resource_group_name = "ME_${module.naming.container_app_environment.name}_${azurerm_resource_group.main.name}_${azurerm_resource_group.main.location}"
+
   # NAT Gateway egress requires a workload profiles environment (not Consumption-only).
   workload_profile {
     name                  = "Consumption"
@@ -410,7 +413,7 @@ resource "azurerm_container_app" "aggregator_backend" {
 
   ingress {
     allow_insecure_connections = true
-    external_enabled           = false
+    external_enabled           = true
     target_port                = 80
     traffic_weight {
       percentage      = 100
@@ -515,7 +518,7 @@ resource "azurerm_linux_web_app" "frontend" {
   virtual_network_subnet_id = azurerm_subnet.snet_webapp.id
 
   # Disable public access — only reachable via AGW from within the VNet
-  public_network_access_enabled = false
+  public_network_access_enabled = true
 
   # Crucial: Wait for the images to be pushed before deploying
   depends_on = [null_resource.docker_images]
@@ -598,10 +601,10 @@ resource "azurerm_api_management_api" "aggregator" {
   api_management_name   = azurerm_api_management.apim.name
   revision              = "1"
   display_name          = "Aggregator API"
-  path                  = ""
+  path                  = "api"
   protocols             = ["https"]
   subscription_required = false
-  service_url           = "https://${azurerm_container_app.aggregator_backend.ingress[0].fqdn}"
+  service_url           = "https://${azurerm_container_app.aggregator_backend.ingress[0].fqdn}/api"
 }
 
 resource "azurerm_api_management_api_operation" "publish_event" {
@@ -611,7 +614,7 @@ resource "azurerm_api_management_api_operation" "publish_event" {
   resource_group_name = azurerm_resource_group.main.name
   display_name        = "Publish Event"
   method              = "POST"
-  url_template        = "/api/publish-event"
+  url_template        = "/publish-event"
   response {
     status_code = 200
   }
@@ -624,7 +627,7 @@ resource "azurerm_api_management_api_operation" "event_status" {
   resource_group_name = azurerm_resource_group.main.name
   display_name        = "Event Status"
   method              = "GET"
-  url_template        = "/api/event-status"
+  url_template        = "/event-status"
   response {
     status_code = 200
   }
@@ -637,7 +640,7 @@ resource "azurerm_api_management_api_operation" "aggregated_data" {
   resource_group_name = azurerm_resource_group.main.name
   display_name        = "Aggregated Data"
   method              = "GET"
-  url_template        = "/api/aggregated-data"
+  url_template        = "/aggregated-data"
   response {
     status_code = 200
   }
@@ -697,7 +700,6 @@ resource "azurerm_public_ip" "apgw" {
 
 
 resource "azurerm_application_gateway" "res-0" {
-  enable_http2       = true
   fips_enabled       = false
   firewall_policy_id = azurerm_web_application_firewall_policy.res-0.id
   # firewall_policy_id                = "/subscriptions/bf64dbbf-7dac-472e-92ca-6ee6c08d1055/resourceGroups/rg-howden-dev-ins-01/providers/Microsoft.Network/applicationGatewayWebApplicationFirewallPolicies/wafhowdendevins01"
