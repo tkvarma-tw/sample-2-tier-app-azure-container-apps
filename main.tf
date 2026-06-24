@@ -2,7 +2,7 @@ terraform {
   required_providers {
     azurerm = {
       source  = "hashicorp/azurerm"
-      version = "~> 3.100.0"
+      version = "~> 4.80.0"
     }
     null = {
       source  = "hashicorp/null"
@@ -117,17 +117,43 @@ resource "azurerm_subnet" "snet_apim" {
   address_prefixes     = ["10.0.5.0/24"]
 }
 
-resource "azurerm_network_security_group" "nsg_apim" {
+# --- NSG for APIM subnet (required for Internal VNet mode) ---
+# Internal-mode APIM rejects inbound by default; it needs the management
+# endpoint (3443) open from the ApiManagement service tag and the infra
+# load balancer (6390). Default NSG rules cover everything else.
+resource "azurerm_network_security_group" "apim" {
+  name                = "${module.naming.network_security_group.name}-apim"
   location            = azurerm_resource_group.main.location
-  name                = module.naming.network_security_group.name
   resource_group_name = azurerm_resource_group.main.name
-  security_rule       = []
-  tags                = {}
+
+  security_rule {
+    name                       = "AllowApimManagementInbound"
+    priority                   = 100
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "3443"
+    source_address_prefix      = "ApiManagement"
+    destination_address_prefix = "VirtualNetwork"
+  }
+
+  security_rule {
+    name                       = "AllowAzureLoadBalancerInbound"
+    priority                   = 110
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "6390"
+    source_address_prefix      = "AzureLoadBalancer"
+    destination_address_prefix = "VirtualNetwork"
+  }
 }
 
-resource "azurerm_subnet_network_security_group_association" "nsg_apim_association" {
+resource "azurerm_subnet_network_security_group_association" "apim" {
   subnet_id                 = azurerm_subnet.snet_apim.id
-  network_security_group_id = azurerm_network_security_group.nsg_apim.id
+  network_security_group_id = azurerm_network_security_group.apim.id
 }
 
 resource "azurerm_subnet" "snet_appgateway" {
@@ -135,7 +161,7 @@ resource "azurerm_subnet" "snet_appgateway" {
   resource_group_name  = azurerm_resource_group.main.name
   virtual_network_name = azurerm_virtual_network.vnet.name
   address_prefixes     = ["10.0.4.0/24"]
-  service_endpoints = ["Microsoft.Web"]
+  service_endpoints    = ["Microsoft.Web"]
 
 }
 
@@ -270,7 +296,7 @@ resource "azurerm_container_app" "backend" {
   container_app_environment_id = azurerm_container_app_environment.cae.id
   resource_group_name          = azurerm_resource_group.main.name
   revision_mode                = "Single"
-  workload_profile_name         = "Consumption"
+  workload_profile_name        = "Consumption"
 
   identity {
     type = "SystemAssigned"
@@ -339,7 +365,7 @@ resource "azurerm_container_app" "aggregator_backend" {
   container_app_environment_id = azurerm_container_app_environment.cae.id
   resource_group_name          = azurerm_resource_group.main.name
   revision_mode                = "Single"
-  workload_profile_name         = "Consumption"
+  workload_profile_name        = "Consumption"
 
   identity {
     type = "SystemAssigned"
@@ -384,7 +410,7 @@ resource "azurerm_container_app" "aggregator_backend" {
 
   ingress {
     allow_insecure_connections = true
-    external_enabled           = true
+    external_enabled           = false
     target_port                = 80
     traffic_weight {
       percentage      = 100
@@ -488,12 +514,15 @@ resource "azurerm_linux_web_app" "frontend" {
   # Connect to the VNet Subnet
   virtual_network_subnet_id = azurerm_subnet.snet_webapp.id
 
+  # Disable public access — only reachable via AGW from within the VNet
+  public_network_access_enabled = false
+
   # Crucial: Wait for the images to be pushed before deploying
   depends_on = [null_resource.docker_images]
 
   site_config {
     # Force traffic to use Private DNS for resolution
-    vnet_route_all_enabled = true
+    vnet_route_all_enabled        = true
     ip_restriction_default_action = "Deny"
 
     # --- HEALTH PROBE CONFIGURATION ---
@@ -509,17 +538,96 @@ resource "azurerm_linux_web_app" "frontend" {
     }
 
     ip_restriction {
-      action                    = "Allow"
-      name                      = "InboundRuleWebApp${var.instance}"
-      priority                  = 1
+      action   = "Allow"
+      name     = "InboundRuleWebApp${var.instance}"
+      priority = 1
       # virtual_network_subnet_id = "/subscriptions/bf64dbbf-7dac-472e-92ca-6ee6c08d1055/resourceGroups/rg-howden-dev-ins-01/providers/Microsoft.Network/virtualNetworks/vnet-howden-dev-ins-01/subnets/snet-appgateway"
       virtual_network_subnet_id = azurerm_subnet.snet_appgateway.id
     }
   }
 
   app_settings = {
-    "BACKEND_URL"                         = "https://${azurerm_container_app.aggregator_backend.ingress[0].fqdn}"
+    "BACKEND_URL"                         = azurerm_api_management.apim.gateway_url
     "WEBSITES_ENABLE_APP_SERVICE_STORAGE" = "false"
+  }
+}
+
+resource "azurerm_api_management" "apim" {
+  name                = module.naming.api_management.name
+  location            = azurerm_resource_group.main.location
+  resource_group_name = azurerm_resource_group.main.name
+  publisher_name      = module.naming.resource_group.name
+  publisher_email     = "admin@example.com"
+
+  # Developer tier supports classic Internal VNet injection (no SLA; demo use).
+  sku_name = "Developer_1"
+
+  # Internal mode — APIM gets a private VIP on snet-apim; no public gateway.
+  virtual_network_type = "Internal"
+  virtual_network_configuration {
+    subnet_id = azurerm_subnet.snet_apim.id
+  }
+
+  identity {
+    type = "SystemAssigned"
+  }
+
+  # NSG must be in place before APIM is injected into the subnet.
+  depends_on = [azurerm_subnet_network_security_group_association.apim]
+}
+
+# --- APIM API: forwards the frontend's calls to the (internal) Aggregator ---
+# path="" puts operations at the gateway root, and each operation carries the
+# full /api/... path, so APIM forwards to service_url + /api/... unchanged —
+# exactly the routes aggregator-backend/server.js already serves.
+resource "azurerm_api_management_api" "aggregator" {
+  name                  = "aggregator-api"
+  resource_group_name   = azurerm_resource_group.main.name
+  api_management_name   = azurerm_api_management.apim.name
+  revision              = "1"
+  display_name          = "Aggregator API"
+  path                  = ""
+  protocols             = ["https"]
+  subscription_required = false
+  service_url           = "https://${azurerm_container_app.aggregator_backend.ingress[0].fqdn}"
+}
+
+resource "azurerm_api_management_api_operation" "publish_event" {
+  operation_id        = "publish-event"
+  api_name            = azurerm_api_management_api.aggregator.name
+  api_management_name = azurerm_api_management.apim.name
+  resource_group_name = azurerm_resource_group.main.name
+  display_name        = "Publish Event"
+  method              = "POST"
+  url_template        = "/api/publish-event"
+  response {
+    status_code = 200
+  }
+}
+
+resource "azurerm_api_management_api_operation" "event_status" {
+  operation_id        = "event-status"
+  api_name            = azurerm_api_management_api.aggregator.name
+  api_management_name = azurerm_api_management.apim.name
+  resource_group_name = azurerm_resource_group.main.name
+  display_name        = "Event Status"
+  method              = "GET"
+  url_template        = "/api/event-status"
+  response {
+    status_code = 200
+  }
+}
+
+resource "azurerm_api_management_api_operation" "aggregated_data" {
+  operation_id        = "aggregated-data"
+  api_name            = azurerm_api_management_api.aggregator.name
+  api_management_name = azurerm_api_management.apim.name
+  resource_group_name = azurerm_resource_group.main.name
+  display_name        = "Aggregated Data"
+  method              = "GET"
+  url_template        = "/api/aggregated-data"
+  response {
+    status_code = 200
   }
 }
 
@@ -565,9 +673,9 @@ resource "azurerm_application_gateway" "res-0" {
   tags                              = {}
   zones                             = []
   backend_address_pool {
-    fqdns        = [azurerm_linux_web_app.frontend.default_hostname] #TODO Will check tomorrow
+    name         = "backend-pool-frontend-${var.instance}"
+    fqdns        = [azurerm_linux_web_app.frontend.default_hostname]
     ip_addresses = []
-    name         = "backend-pool-webapp-${var.instance}"
   }
 
   ssl_policy {
@@ -575,14 +683,14 @@ resource "azurerm_application_gateway" "res-0" {
     policy_name = "AppGwSslPolicy20220101"
   }
   backend_http_settings {
-    cookie_based_affinity                = "Disabled"
-    name                                 = "backend-settings-${var.instance}"
-    pick_host_name_from_backend_address  = true
-    port                                 = 80
-    probe_name                           = "healthprobe${var.instance}"
-    protocol                             = "Http"
-    request_timeout                      = 20
-    trusted_root_certificate_names       = []
+    cookie_based_affinity               = "Disabled"
+    name                                = "backend-settings-${var.instance}"
+    pick_host_name_from_backend_address = true
+    port                                = 80
+    probe_name                          = "healthprobe${var.instance}"
+    protocol                            = "Http"
+    request_timeout                     = 20
+    trusted_root_certificate_names      = []
   }
   frontend_ip_configuration {
     name                            = "appGwPublicFrontendIpIPv4"
@@ -591,7 +699,7 @@ resource "azurerm_application_gateway" "res-0" {
     private_link_configuration_name = ""
     public_ip_address_id            = azurerm_public_ip.apgw.id
     # public_ip_address_id            = "/subscriptions/bf64dbbf-7dac-472e-92ca-6ee6c08d1055/resourceGroups/rg-howden-dev-ins-01/providers/Microsoft.Network/publicIPAddresses/pip-howden-dev-ins-02"
-    subnet_id = ""
+    subnet_id = azurerm_subnet.snet_appgateway.id
   }
   frontend_port {
     name = "port_80"
@@ -623,12 +731,12 @@ resource "azurerm_application_gateway" "res-0" {
     }
   }
   request_routing_rule {
-    backend_address_pool_name   = "backend-pool-webapp-${var.instance}"
-    backend_http_settings_name  = "backend-settings-${var.instance}"
-    http_listener_name          = "Listener${var.instance}"
-    name                        = "Rule${var.instance}"
-    priority                    = 1
-    rule_type                   = "Basic"
+    backend_address_pool_name  = "backend-pool-frontend-${var.instance}"
+    backend_http_settings_name = "backend-settings-${var.instance}"
+    http_listener_name         = "Listener${var.instance}"
+    name                       = "Rule${var.instance}"
+    priority                   = 1
+    rule_type                  = "Basic"
   }
   sku {
     capacity = 1
@@ -679,4 +787,45 @@ output "servicebus_private_endpoint_ip" {
 output "private_dns_zone_id" {
   value       = azurerm_private_dns_zone.servicebus.id
   description = "Private DNS zone ID for Service Bus (privatelink.servicebus.windows.net)."
+}
+
+output "application_gateway_ip" {
+  value       = azurerm_public_ip.apgw.ip_address
+  description = "The static public IP address of the Application Gateway."
+}
+
+output "apim_gateway_url" {
+  value       = azurerm_api_management.apim.gateway_url
+  description = "APIM internal gateway URL (resolves to the private VIP via the azure-api.net private DNS zone)."
+}
+
+output "apim_name" {
+  value       = azurerm_api_management.apim.name
+  description = "The API Management service name."
+}
+
+# --- Private DNS for APIM (Internal VNet mode) ---
+# Internal-mode APIM responds only to its default FQDN (<name>.azure-api.net),
+# never to its raw private IP, so we host that zone privately and point the
+# gateway hostname at the APIM private VIP. Microsoft suggests scoping rather
+# than hosting the whole azure-api.net zone, but for this isolated single-VNet
+# demo the full-zone approach is simplest and safe.
+resource "azurerm_private_dns_zone" "apim" {
+  name                = "azure-api.net"
+  resource_group_name = azurerm_resource_group.main.name
+}
+
+resource "azurerm_private_dns_zone_virtual_network_link" "apim_vnet_link" {
+  name                  = "apim-vnet-link"
+  resource_group_name   = azurerm_resource_group.main.name
+  private_dns_zone_name = azurerm_private_dns_zone.apim.name
+  virtual_network_id    = azurerm_virtual_network.vnet.id
+}
+
+resource "azurerm_private_dns_a_record" "apim" {
+  name                = azurerm_api_management.apim.name
+  zone_name           = azurerm_private_dns_zone.apim.name
+  resource_group_name = azurerm_resource_group.main.name
+  ttl                 = 300
+  records             = [azurerm_api_management.apim.private_ip_addresses[0]]
 }
