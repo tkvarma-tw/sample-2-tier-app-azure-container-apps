@@ -117,11 +117,26 @@ resource "azurerm_subnet" "snet_apim" {
   address_prefixes     = ["10.0.5.0/24"]
 }
 
+resource "azurerm_network_security_group" "nsg_apim" {
+  location            = azurerm_resource_group.main.location
+  name                = module.naming.network_security_group.name
+  resource_group_name = azurerm_resource_group.main.name
+  security_rule       = []
+  tags                = {}
+}
+
+resource "azurerm_subnet_network_security_group_association" "nsg_apim_association" {
+  subnet_id                 = azurerm_subnet.snet_apim.id
+  network_security_group_id = azurerm_network_security_group.nsg_apim.id
+}
+
 resource "azurerm_subnet" "snet_appgateway" {
   name                 = "snet-appgateway"
   resource_group_name  = azurerm_resource_group.main.name
   virtual_network_name = azurerm_virtual_network.vnet.name
   address_prefixes     = ["10.0.4.0/24"]
+  service_endpoints = ["Microsoft.Web"]
+
 }
 
 # --- Private Subnet for Service Bus Private Endpoint ---
@@ -255,6 +270,7 @@ resource "azurerm_container_app" "backend" {
   container_app_environment_id = azurerm_container_app_environment.cae.id
   resource_group_name          = azurerm_resource_group.main.name
   revision_mode                = "Single"
+  workload_profile_name         = "Consumption"
 
   identity {
     type = "SystemAssigned"
@@ -323,6 +339,7 @@ resource "azurerm_container_app" "aggregator_backend" {
   container_app_environment_id = azurerm_container_app_environment.cae.id
   resource_group_name          = azurerm_resource_group.main.name
   revision_mode                = "Single"
+  workload_profile_name         = "Consumption"
 
   identity {
     type = "SystemAssigned"
@@ -477,6 +494,7 @@ resource "azurerm_linux_web_app" "frontend" {
   site_config {
     # Force traffic to use Private DNS for resolution
     vnet_route_all_enabled = true
+    ip_restriction_default_action = "Deny"
 
     # --- HEALTH PROBE CONFIGURATION ---
     health_check_path                 = "/health"
@@ -488,6 +506,14 @@ resource "azurerm_linux_web_app" "frontend" {
       docker_registry_url      = "https://${azurerm_container_registry.acr.login_server}"
       docker_registry_username = azurerm_container_registry.acr.admin_username
       docker_registry_password = azurerm_container_registry.acr.admin_password
+    }
+
+    ip_restriction {
+      action                    = "Allow"
+      name                      = "InboundRuleWebApp${var.instance}"
+      priority                  = 1
+      # virtual_network_subnet_id = "/subscriptions/bf64dbbf-7dac-472e-92ca-6ee6c08d1055/resourceGroups/rg-howden-dev-ins-01/providers/Microsoft.Network/virtualNetworks/vnet-howden-dev-ins-01/subnets/snet-appgateway"
+      virtual_network_subnet_id = azurerm_subnet.snet_appgateway.id
     }
   }
 
@@ -542,6 +568,11 @@ resource "azurerm_application_gateway" "res-0" {
     fqdns        = [azurerm_linux_web_app.frontend.default_hostname] #TODO Will check tomorrow
     ip_addresses = []
     name         = "backend-pool-webapp-${var.instance}"
+  }
+
+  ssl_policy {
+    policy_type = "Predefined"
+    policy_name = "AppGwSslPolicy20220101"
   }
   backend_http_settings {
     cookie_based_affinity                = "Disabled"
