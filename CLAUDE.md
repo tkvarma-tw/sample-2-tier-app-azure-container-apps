@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Big Picture
 
-This is a **single-file Terraform project** (`main.tf`, ~712 lines) that provisions a complete Azure application architecture and deploys three Node.js/Express microservices. There are no `package.json` files committed — dependencies are installed at Docker build time via `npm install` in each Dockerfile. Region is `southindia`.
+This is a **single-file Terraform project** (`main.tf`, ~850 lines) that provisions a complete Azure application architecture and deploys three Node.js/Express microservices. There are no `package.json` files committed — dependencies are installed at Docker build time via `npm install` in each Dockerfile. Region is `southindia`.
 
 ### Architecture (request path)
 
@@ -21,6 +21,7 @@ Frontend Web App (Linux App Service, :80) — PRIVATE (public_network_access_ena
 API Management (Developer_1, Internal VNet mode, private VIP)   ← snet-apim
     │  frontend BACKEND_URL = APIM gateway_url (https://<name>.azure-api.net, resolves to private VIP)
     │  "aggregator-api" forwards POST /api/publish-event, GET /api/event-status, GET /api/aggregated-data
+    │  outbound policy stamps X-Served-Via-APIM header → frontend renders a "Routed through APIM" badge
     ▼
 Aggregator Backend / Service B (Container App, :80, INTERNAL ingress)
     │  publishes events to Service Bus; proxies /api/event-status and /api/aggregated-data to Backend A
@@ -31,7 +32,7 @@ Backend / Service A (Container App, :80, INTERNAL ingress)   ← snet-cae
     └──→ api.met.no (outbound via NAT Gateway static IP)
 ```
 
-> **APIM routing:** `azurerm_api_management_api.aggregator` (path `""`, `subscription_required = false`, `service_url` = aggregator internal FQDN) plus three `azurerm_api_management_api_operation` resources forward the frontend's calls to the aggregator unchanged. APIM is Internal-mode, injected into `snet-apim` (needs `azurerm_network_security_group.apim` allowing inbound 3443/6390); its gateway host resolves to the private VIP via the `azure-api.net` private DNS zone. APIM in Developer/Internal mode takes ~30–45 min to provision/update.
+> **APIM routing:** `azurerm_api_management_api.aggregator` (path `""`, `subscription_required = false`, `service_url` = aggregator internal FQDN) plus three `azurerm_api_management_api_operation` resources forward the frontend's calls to the aggregator unchanged. `azurerm_api_management_api_policy.aggregator` is an outbound policy that stamps the `X-Served-Via-APIM` response header (demo proof-of-path — the aggregator never sets it; `frontend/server.js` reads it and shows a badge). APIM is Internal-mode, injected into `snet-apim` (needs `azurerm_network_security_group.apim` allowing inbound 3443/6390); its gateway host resolves to the private VIP via the `azure-api.net` private DNS zone. APIM in Developer/Internal mode takes ~30–45 min to provision/update.
 
 **Services:**
 
@@ -43,10 +44,10 @@ Backend / Service A (Container App, :80, INTERNAL ingress)   ← snet-cae
 
 ## Key Files
 
-- **`main.tf`** (~712 lines) — The single source of truth for all Azure infrastructure. Covers: resource group, VNet (5 subnets), NAT Gateway, ACR, Container App Environment, 2 (internal) Container Apps, Service Bus (Premium, 1 partition) + private endpoint/DNS, App Service Plan + Frontend Web App, **Application Gateway (WAF_v2) + WAF policy**, and **API Management (Developer_1, Internal VNet mode)** + its `aggregator-api` routing + private DNS.
+- **`main.tf`** (~850 lines) — The single source of truth for all Azure infrastructure. Covers: resource group, VNet (5 subnets), NAT Gateway, ACR, Container App Environment, 2 (internal) Container Apps, Service Bus (Premium, 1 partition) + private endpoint/DNS, App Service Plan + Frontend Web App, **Application Gateway (WAF_v2) + WAF policy**, and **API Management (Developer_1, Internal VNet mode)** + its `aggregator-api` routing/policy + private DNS.
 - **`backend/server.js`** — Fetches weather from MET Norway API (`api.met.no`), subscribes to Service Bus topic, exposes `/api/data` and `/api/event-status`.
 - **`aggregator-backend/server.js`** — Publishes events to Service Bus, proxies `/api/event-status` and `/api/aggregated-data` to Backend A, exposes `/api/publish-event`.
-- **`frontend/server.js`** — Serves HTML dashboard (weather display + event publishing UI), exposes `/health` (used by the App Gateway probe), proxies API calls to `BACKEND_URL`.
+- **`frontend/server.js`** — Serves HTML dashboard (weather display + event publishing UI), exposes `/health` (used by the App Gateway probe), proxies API calls to `BACKEND_URL`, and renders a "Routed through APIM" badge from the `x-served-via-apim` response header.
 
 ## Working with This Codebase
 
@@ -62,9 +63,9 @@ Deployment triggers Docker build/push automatically via `null_resource.docker_im
 
 ### Key Terraform Resources
 
-- `azurerm_container_app.backend` — Backend A, **internal** ingress (resolvable only from within the VNet)
-- `azurerm_container_app.aggregator_backend` — Service B, **internal** ingress (`external_enabled = false`)
-- `azurerm_linux_web_app.frontend` — Frontend; VNet-integrated via `snet_webapp`, `public_network_access_enabled = false`, `/health` health check
+- `azurerm_container_app.backend` — Backend A, **internal** ingress (resolvable only from within the VNet), `workload_profile_name = "Consumption"`
+- `azurerm_container_app.aggregator_backend` — Service B, **internal** ingress (`external_enabled = false`), `workload_profile_name = "Consumption"`
+- `azurerm_linux_web_app.frontend` — Frontend; VNet-integrated via `snet_webapp`, `public_network_access_enabled = false`, `/health` health check. Also locked down with `ip_restriction_default_action = "Deny"` + an `ip_restriction` allowing only `snet_appgateway` (so only the App Gateway can reach it)
 - `azurerm_application_gateway.res-0` — WAF_v2 App Gateway fronting the frontend (public IP `azurerm_public_ip.apgw`, `/health` probe); backend pool = frontend's `default_hostname`
 - `azurerm_web_application_firewall_policy.res-0` — OWASP 3.2 ruleset, **Detection** mode
 - `azurerm_api_management.apim` — APIM Developer_1, **Internal** VNet mode (`virtual_network_type = "Internal"`, injected into `snet-apim`), system-assigned identity. Routing via `azurerm_api_management_api.aggregator` + 3 operations → aggregator. Requires `azurerm_network_security_group.apim` (inbound 3443/6390) and the `azure-api.net` private DNS zone
@@ -89,6 +90,7 @@ Subnets (all in `10.0.0.0/16`): `snet-pe` (`10.0.0.0/24`, Service Bus PE), `snet
 ### Making Changes
 
 - **Application code changes** → Edit `server.js` in the relevant directory. ⚠️ `null_resource.docker_images.triggers` only hashes `backend/server.js` and `frontend/server.js` (plus `app_version`). Its `local-exec` still builds/pushes **all three** images, but **editing only `aggregator-backend/server.js` will NOT re-trigger a rebuild** — bump `var.app_version` or run `terraform taint null_resource.docker_images` to force one.
+- ⚠️ **Re-pushed same-tag images aren't auto-pulled.** Images are tagged with `var.app_version` (default `v1`). Rebuilding pushes a new `:v1`, but the Web App / Container Apps pin that tag and won't redeploy on `apply`. To pick up a code change, **restart the Web App / Container App** (or bump `app_version`). APIM/infra-only changes apply normally.
 - **Infrastructure changes** → Edit `main.tf`. The naming module (`Azure/naming/azurerm ~> 0.4.0`) generates consistent resource names from `suffix = [workload, environment, region_abbr, instance]`.
 - **Add a new service** → Create a directory with `server.js` + `Dockerfile`, add the image build/push to `null_resource.docker_images` (and its `triggers` hash), and add the corresponding `azurerm_container_app` resource.
 
