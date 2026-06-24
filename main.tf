@@ -37,7 +37,7 @@ variable "region_abbr" {
 
 variable "instance" {
   type    = string
-  default = "01"
+  default = "10"
 }
 
 variable "app_version" {
@@ -255,6 +255,7 @@ resource "azurerm_container_app_environment" "cae" {
   name                = module.naming.container_app_environment.name
   location            = azurerm_resource_group.main.location
   resource_group_name = azurerm_resource_group.main.name
+  infrastructure_resource_group_name = "ME_cae-${azurerm_resource_group.main.name}"
 
   # Lock it inside the Virtual Network
   infrastructure_subnet_id       = azurerm_subnet.snet_cae.id
@@ -408,9 +409,17 @@ resource "azurerm_container_app" "aggregator_backend" {
     max_replicas = 1
   }
 
+  # external_enabled = true exposes the aggregator on the Container App
+  # Environment's load balancer. Because the environment is internal-LB
+  # (internal_load_balancer_enabled = true), this is VNet-visible only — NOT
+  # public. APIM lives in snet-apim (outside this environment); an
+  # internal-ingress (external_enabled = false) app is reachable ONLY from other
+  # apps inside the same environment, so APIM cannot route to it and the
+  # environment returns 404. Making it external lets APIM reach it while it
+  # stays private to the VNet. The FQDN drops the ".internal." label as a result.
   ingress {
     allow_insecure_connections = true
-    external_enabled           = false
+    external_enabled           = true
     target_port                = 80
     traffic_weight {
       percentage      = 100
@@ -514,8 +523,12 @@ resource "azurerm_linux_web_app" "frontend" {
   # Connect to the VNet Subnet
   virtual_network_subnet_id = azurerm_subnet.snet_webapp.id
 
-  # Disable public access — only reachable via AGW from within the VNet
-  public_network_access_enabled = false
+  # Public access stays enabled but is locked to the App Gateway by the
+  # access-restriction rules below (default Deny + Allow snet-appgateway over
+  # the Microsoft.Web service endpoint). Disabling public access entirely makes
+  # App Service 403 ALL traffic (incl. the AGW probe) since no private endpoint
+  # exists, which breaks the gateway with 502.
+  public_network_access_enabled = true
 
   # Crucial: Wait for the images to be pushed before deploying
   depends_on = [null_resource.docker_images]
@@ -580,7 +593,7 @@ resource "azurerm_api_management" "apim" {
 
 # --- Public IP for APIM Management (Required for stv2 platform) ---
 resource "azurerm_public_ip" "apim" {
-  name                = "${module.naming.public_ip.name}-apim"
+  name                = "${module.naming.public_ip.name}-apim02"
   location            = azurerm_resource_group.main.location
   resource_group_name = azurerm_resource_group.main.name
   allocation_method   = "Static"
@@ -697,7 +710,6 @@ resource "azurerm_public_ip" "apgw" {
 
 
 resource "azurerm_application_gateway" "res-0" {
-  enable_http2       = true
   fips_enabled       = false
   firewall_policy_id = azurerm_web_application_firewall_policy.res-0.id
   # firewall_policy_id                = "/subscriptions/bf64dbbf-7dac-472e-92ca-6ee6c08d1055/resourceGroups/rg-howden-dev-ins-01/providers/Microsoft.Network/applicationGatewayWebApplicationFirewallPolicies/wafhowdendevins01"
