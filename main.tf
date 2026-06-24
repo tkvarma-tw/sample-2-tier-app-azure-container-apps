@@ -37,7 +37,7 @@ variable "region_abbr" {
 
 variable "instance" {
   type    = string
-  default = "02"
+  default = "01"
 }
 
 variable "app_version" {
@@ -411,6 +411,14 @@ resource "azurerm_container_app" "aggregator_backend" {
     max_replicas = 1
   }
 
+  # external_enabled = true exposes the aggregator on the Container App
+  # Environment's load balancer. Because the environment is internal-LB
+  # (internal_load_balancer_enabled = true), this is VNet-visible only — NOT
+  # public. APIM lives in snet-apim (outside this environment); an
+  # internal-ingress (external_enabled = false) app is reachable ONLY from other
+  # apps inside the same environment, so APIM cannot route to it and the
+  # environment returns 404. Making it external lets APIM reach it while it
+  # stays private to the VNet. The FQDN drops the ".internal." label as a result.
   ingress {
     allow_insecure_connections = true
     external_enabled           = true
@@ -517,7 +525,11 @@ resource "azurerm_linux_web_app" "frontend" {
   # Connect to the VNet Subnet
   virtual_network_subnet_id = azurerm_subnet.snet_webapp.id
 
-  # Disable public access — only reachable via AGW from within the VNet
+  # Public access stays enabled but is locked to the App Gateway by the
+  # access-restriction rules below (default Deny + Allow snet-appgateway over
+  # the Microsoft.Web service endpoint). Disabling public access entirely makes
+  # App Service 403 ALL traffic (incl. the AGW probe) since no private endpoint
+  # exists, which breaks the gateway with 502.
   public_network_access_enabled = true
 
   # Crucial: Wait for the images to be pushed before deploying
@@ -583,7 +595,7 @@ resource "azurerm_api_management" "apim" {
 
 # --- Public IP for APIM Management (Required for stv2 platform) ---
 resource "azurerm_public_ip" "apim" {
-  name                = "${module.naming.public_ip.name}-apim"
+  name                = "${module.naming.public_ip.name}-apim02"
   location            = azurerm_resource_group.main.location
   resource_group_name = azurerm_resource_group.main.name
   allocation_method   = "Static"

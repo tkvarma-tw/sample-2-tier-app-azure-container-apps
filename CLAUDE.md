@@ -15,7 +15,7 @@ Internet
 Application Gateway (WAF_v2, public IP, OWASP 3.2 Detection, /health probe)   ← snet-appgateway
     │
     ▼
-Frontend Web App (Linux App Service, :80) — PRIVATE (public_network_access_enabled = false)   ← snet-webapp
+Frontend Web App (Linux App Service, :80) — public access ENABLED but locked to snet-appgateway   ← snet-webapp
     │  serves HTML UI; proxies /api/publish-event, /api/event-status; renders /api/aggregated-data
     ▼
 API Management (Developer_1, Internal VNet mode, private VIP)   ← snet-apim
@@ -23,7 +23,7 @@ API Management (Developer_1, Internal VNet mode, private VIP)   ← snet-apim
     │  "aggregator-api" forwards POST /api/publish-event, GET /api/event-status, GET /api/aggregated-data
     │  outbound policy stamps X-Served-Via-APIM header → frontend renders a "Routed through APIM" badge
     ▼
-Aggregator Backend / Service B (Container App, :80, INTERNAL ingress)
+Aggregator Backend / Service B (Container App, :80, EXTERNAL ingress = VNet-visible, not public)
     │  publishes events to Service Bus; proxies /api/event-status and /api/aggregated-data to Backend A
     ├──→ Azure Service Bus (topic: demo-events, subscription: demo-processor)  via private endpoint  ← snet-pe
     ▼
@@ -32,19 +32,19 @@ Backend / Service A (Container App, :80, INTERNAL ingress)   ← snet-cae
     └──→ api.met.no (outbound via NAT Gateway static IP)
 ```
 
-> **APIM routing:** `azurerm_api_management_api.aggregator` (path `""`, `subscription_required = false`, `service_url` = aggregator internal FQDN) plus three `azurerm_api_management_api_operation` resources forward the frontend's calls to the aggregator unchanged. `azurerm_api_management_api_policy.aggregator` is an outbound policy that stamps the `X-Served-Via-APIM` response header (demo proof-of-path — the aggregator never sets it; `frontend/server.js` reads it and shows a badge). APIM is Internal-mode, injected into `snet-apim` (needs `azurerm_network_security_group.apim` allowing inbound 3443/6390); its gateway host resolves to the private VIP via the `azure-api.net` private DNS zone. APIM in Developer/Internal mode takes ~30–45 min to provision/update.
+> **APIM routing:** `azurerm_api_management_api.aggregator` (path `""`, `subscription_required = false`, `service_url` = aggregator FQDN via `ingress[0].fqdn`) plus three `azurerm_api_management_api_operation` resources forward the frontend's calls to the aggregator unchanged. `azurerm_api_management_api_policy.aggregator` is an outbound policy that stamps the `X-Served-Via-APIM` response header (demo proof-of-path — the aggregator never sets it; `frontend/server.js` reads it and shows a badge). APIM is Internal-mode, injected into `snet-apim` (needs `azurerm_network_security_group.apim` allowing inbound 3443/6390); its gateway host resolves to the private VIP via the `azure-api.net` private DNS zone. APIM in Developer/Internal mode takes ~30–45 min to provision/update.
 
 **Services:**
 
 | Service | Dir | Port | Node | Key Deps | Exposure |
 |---|---|---|---|---|---|
 | Frontend | `frontend/` | 80 | 18 (alpine) | express, axios | Private Web App, public access via Application Gateway only |
-| Aggregator (Service B) | `aggregator-backend/` | 80 | 20 (alpine) | express, axios, @azure/service-bus, @azure/identity | Internal (Container App) |
+| Aggregator (Service B) | `aggregator-backend/` | 80 | 20 (alpine) | express, axios, @azure/service-bus, @azure/identity | External-on-internal-CAE (VNet-visible, not public) |
 | Backend (Service A) | `backend/` | 80 | 18 (alpine) | express, axios, @azure/service-bus, @azure/identity | Internal (Container App) |
 
 ## Key Files
 
-- **`main.tf`** (~850 lines) — The single source of truth for all Azure infrastructure. Covers: resource group, VNet (5 subnets), NAT Gateway, ACR, Container App Environment, 2 (internal) Container Apps, Service Bus (Premium, 1 partition) + private endpoint/DNS, App Service Plan + Frontend Web App, **Application Gateway (WAF_v2) + WAF policy**, and **API Management (Developer_1, Internal VNet mode)** + its `aggregator-api` routing/policy + private DNS.
+- **`main.tf`** (~850 lines) — The single source of truth for all Azure infrastructure. Covers: resource group, VNet (5 subnets), NAT Gateway, ACR, Container App Environment (internal-LB), 2 Container Apps (Backend A internal, Aggregator VNet-visible), Service Bus (Premium, 1 partition) + private endpoint/DNS, App Service Plan + Frontend Web App, **Application Gateway (WAF_v2) + WAF policy**, and **API Management (Developer_1, Internal VNet mode)** + its `aggregator-api` routing/policy + private DNS.
 - **`backend/server.js`** — Fetches weather from MET Norway API (`api.met.no`), subscribes to Service Bus topic, exposes `/api/data` and `/api/event-status`.
 - **`aggregator-backend/server.js`** — Publishes events to Service Bus, proxies `/api/event-status` and `/api/aggregated-data` to Backend A, exposes `/api/publish-event`.
 - **`frontend/server.js`** — Serves HTML dashboard (weather display + event publishing UI), exposes `/health` (used by the App Gateway probe), proxies API calls to `BACKEND_URL`, and renders a "Routed through APIM" badge from the `x-served-via-apim` response header.
@@ -63,9 +63,9 @@ Deployment triggers Docker build/push automatically via `null_resource.docker_im
 
 ### Key Terraform Resources
 
-- `azurerm_container_app.backend` — Backend A, **internal** ingress (resolvable only from within the VNet), `workload_profile_name = "Consumption"`
-- `azurerm_container_app.aggregator_backend` — Service B, **internal** ingress (`external_enabled = false`), `workload_profile_name = "Consumption"`
-- `azurerm_linux_web_app.frontend` — Frontend; VNet-integrated via `snet_webapp`, `public_network_access_enabled = false`, `/health` health check. Also locked down with `ip_restriction_default_action = "Deny"` + an `ip_restriction` allowing only `snet_appgateway` (so only the App Gateway can reach it)
+- `azurerm_container_app.backend` — Backend A, **internal** ingress (`external_enabled = false`; reachable only by other apps inside the CAE — i.e. the aggregator), `workload_profile_name = "Consumption"`
+- `azurerm_container_app.aggregator_backend` — Service B, **external** ingress (`external_enabled = true`). Since the CAE is internal-LB, "external" here means VNet-visible (private), **not** public — this is required so APIM (outside the CAE) can reach it (see Networking gotchas), `workload_profile_name = "Consumption"`
+- `azurerm_linux_web_app.frontend` — Frontend; VNet-integrated via `snet_webapp`, `public_network_access_enabled = true`, `/health` health check. Locked down with `ip_restriction_default_action = "Deny"` + an `ip_restriction` allowing only `snet_appgateway` (so only the App Gateway can reach it — see Networking gotchas for why public access must stay enabled)
 - `azurerm_application_gateway.res-0` — WAF_v2 App Gateway fronting the frontend (public IP `azurerm_public_ip.apgw`, `/health` probe); backend pool = frontend's `default_hostname`
 - `azurerm_web_application_firewall_policy.res-0` — OWASP 3.2 ruleset, **Detection** mode
 - `azurerm_api_management.apim` — APIM Developer_1, **Internal** VNet mode (`virtual_network_type = "Internal"`, injected into `snet-apim`), system-assigned identity. Routing via `azurerm_api_management_api.aggregator` + 3 operations → aggregator. Requires `azurerm_network_security_group.apim` (inbound 3443/6390) and the `azure-api.net` private DNS zone
@@ -76,6 +76,12 @@ Deployment triggers Docker build/push automatically via `null_resource.docker_im
 Subnets (all in `10.0.0.0/16`): `snet-pe` (`10.0.0.0/24`, Service Bus PE), `snet-webapp` (`10.0.1.0/24`, Web delegation), `snet-cae` (`10.0.2.0/23`, App env delegation + NAT), `snet-appgateway` (`10.0.4.0/24`), `snet-apim` (`10.0.5.0/24`).
 
 > Resources named `res-0` (App Gateway, WAF policy) look portal-exported; expect verbose/empty-string arguments there.
+
+### Networking gotchas (cost real debugging time — don't relearn these)
+
+- **APIM → Container App requires the aggregator's ingress to be `external_enabled = true`.** A Container App with internal ingress (`external_enabled = false`) is reachable **only from other apps inside the same Container Apps Environment**, not from elsewhere in the VNet. APIM lives in `snet-apim` (outside the CAE), so against an internal-ingress aggregator the CAE returns **HTTP 404 "this Container App does not exist"** (an Envoy/ingress 404, not an APIM or app 404). The CAE is internal-LB, so `external_enabled = true` exposes it on the **private** VNet IP only (not public). Flipping this also drops the `.internal.` label from the FQDN (`<app>.internal.<domain>` → `<app>.<domain>`); the `*` record in the `…azurecontainerapps.io` private DNS zone only matches the single-label external form. Backend A stays internal because only the aggregator (in-CAE) calls it.
+- **Frontend `public_network_access_enabled` must be `true`, not `false`.** With it `false`, App Service rejects **all** inbound traffic (only a private endpoint would be allowed — none exists) with **HTTP 403**, so the App Gateway probe fails and the gateway returns **502**. Reachability is instead restricted by the access-restriction rules (`ip_restriction_default_action = "Deny"` + allow `snet_appgateway` over the `Microsoft.Web` service endpoint); those rules only take effect while public access is enabled.
+- **Diagnosing from inside the VNet:** internal endpoints (APIM gateway, container FQDNs) aren't resolvable/reachable from a laptop. Run a probe from inside the CAE with `az containerapp exec` (needs a TTY — wrap in `script -q /dev/null …` for non-interactive shells); base64-encode the inline script to survive quote/newline mangling. An APIM-level 404 returns JSON `{"statusCode":404,"message":"Resource not found"}`, whereas a CAE ingress 404 returns the HTML "Container App … does not exist" page — the body tells you which hop failed.
 
 ### Key Environment Variables
 
@@ -103,6 +109,6 @@ Subnets (all in `10.0.0.0/16`): `snet-pe` (`10.0.0.0/24`, Service Bus PE), `snet
 
 - **No package.json files** are committed. Dependencies (`express`, `axios`, `@azure/service-bus`, `@azure/identity`) are installed at Docker build time.
 - **No tests, linting, or CI/CD** exist. This is a demo/PoC codebase.
-- **Both Container Apps are internal-only.** Backend A is reachable only via the Aggregator; the Aggregator is reachable only via APIM. The Frontend Web App has public access disabled and is reachable only through the Application Gateway.
+- **Exposure chain:** Backend A is internal (reachable only by the Aggregator, in-CAE); the Aggregator is VNet-visible (reachable by APIM); the Frontend is reachable only through the Application Gateway. None of these is publicly reachable except via the App Gateway public IP.
 - Both Container Apps use **system-assigned managed identities** for Service Bus auth (no secrets in code): Aggregator = *Data Sender*, Backend = *Data Receiver*. (ACR pull still uses admin user/password.)
 - The `null_resource.docker_images` provisioner requires `az` CLI and Docker (building `linux/amd64`) on the machine running `terraform apply`.
