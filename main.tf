@@ -500,14 +500,14 @@ resource "azurerm_private_dns_a_record" "servicebus" {
 resource "azurerm_role_assignment" "aggregator_backend_sender" {
   scope                = azurerm_servicebus_namespace.main.id
   role_definition_name = "Azure Service Bus Data Sender"
-  principal_id         = azurerm_container_app.aggregator_backend.identity.principal_id
+  principal_id         = azurerm_container_app.aggregator_backend.identity[0].principal_id
 }
 
 # --- Role Assignment: Backend - Service Bus Data Receiver ---
 resource "azurerm_role_assignment" "backend_receiver" {
   scope                = azurerm_servicebus_namespace.main.id
   role_definition_name = "Azure Service Bus Data Receiver"
-  principal_id         = azurerm_container_app.backend.identity.principal_id
+  principal_id         = azurerm_container_app.backend.identity[0].principal_id
 }
 
 # --- App Service Plan ---
