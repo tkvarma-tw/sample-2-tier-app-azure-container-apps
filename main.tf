@@ -207,7 +207,21 @@ resource "azurerm_container_registry" "acr" {
   resource_group_name = azurerm_resource_group.main.name
   location            = azurerm_resource_group.main.location
   sku                 = "Basic"
-  admin_enabled       = true
+  admin_enabled       = false
+}
+
+# --- User-Assigned Managed Identity for Container Apps ---
+resource "azurerm_user_assigned_identity" "container_app_identity" {
+  name                = module.naming.user_assigned_identity.name
+  resource_group_name = azurerm_resource_group.main.name
+  location            = azurerm_resource_group.main.location
+}
+
+# --- Role Assignment: UAMI -> AcrPull on ACR ---
+resource "azurerm_role_assignment" "uami_acr_pull" {
+  scope                = azurerm_container_registry.acr.id
+  role_definition_name = "AcrPull"
+  principal_id         = azurerm_user_assigned_identity.container_app_identity.principal_id
 }
 
 # --- Build and push Docker images to ACR ---
@@ -302,21 +316,16 @@ resource "azurerm_container_app" "backend" {
   workload_profile_name        = "Consumption"
 
   identity {
-    type = "SystemAssigned"
+    type         = "SystemAssigned, UserAssigned"
+    identity_ids = [azurerm_user_assigned_identity.container_app_identity.id]
   }
 
   # Crucial: Wait for the images to be pushed before deploying
   depends_on = [null_resource.docker_images]
 
   registry {
-    server               = azurerm_container_registry.acr.login_server
-    username             = azurerm_container_registry.acr.admin_username
-    password_secret_name = "acr-password"
-  }
-
-  secret {
-    name  = "acr-password"
-    value = azurerm_container_registry.acr.admin_password
+    server   = azurerm_container_registry.acr.login_server
+    identity = azurerm_user_assigned_identity.container_app_identity.id
   }
 
   template {
@@ -371,20 +380,15 @@ resource "azurerm_container_app" "aggregator_backend" {
   workload_profile_name        = "Consumption"
 
   identity {
-    type = "SystemAssigned"
+    type         = "SystemAssigned, UserAssigned"
+    identity_ids = [azurerm_user_assigned_identity.container_app_identity.id]
   }
 
   depends_on = [null_resource.docker_images]
 
   registry {
-    server               = azurerm_container_registry.acr.login_server
-    username             = azurerm_container_registry.acr.admin_username
-    password_secret_name = "acr-password"
-  }
-
-  secret {
-    name  = "acr-password"
-    value = azurerm_container_registry.acr.admin_password
+    server   = azurerm_container_registry.acr.login_server
+    identity = azurerm_user_assigned_identity.container_app_identity.id
   }
 
   template {
@@ -496,14 +500,14 @@ resource "azurerm_private_dns_a_record" "servicebus" {
 resource "azurerm_role_assignment" "aggregator_backend_sender" {
   scope                = azurerm_servicebus_namespace.main.id
   role_definition_name = "Azure Service Bus Data Sender"
-  principal_id         = azurerm_container_app.aggregator_backend.identity[0].principal_id
+  principal_id         = azurerm_container_app.aggregator_backend.identity.principal_id
 }
 
 # --- Role Assignment: Backend - Service Bus Data Receiver ---
 resource "azurerm_role_assignment" "backend_receiver" {
   scope                = azurerm_servicebus_namespace.main.id
   role_definition_name = "Azure Service Bus Data Receiver"
-  principal_id         = azurerm_container_app.backend.identity[0].principal_id
+  principal_id         = azurerm_container_app.backend.identity.principal_id
 }
 
 # --- App Service Plan ---
