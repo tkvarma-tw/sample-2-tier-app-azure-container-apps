@@ -42,7 +42,14 @@ app.post('/api/publish-event', async (req, res) => {
 app.get('/api/event-status', async (req, res) => {
     try {
         const response = await axios.get(`${BACKEND_URL}/api/event-status`, { timeout: 5000 });
-        res.json(response.data);
+        res.json({
+            ...response.data,
+            _servedFrom: {
+                region: process.env.REGION_NAME || 'unknown',
+                instanceId: (process.env.WEBSITE_INSTANCE_ID || 'unknown').slice(0, 12),
+                zone: process.env.WEBSITE_ZONE_ID != null ? `AZ ${parseInt(process.env.WEBSITE_ZONE_ID) + 1}` : 'unknown'
+            }
+        });
     } catch (error) {
         res.status(502).json({ status: 'Error', message: 'Failed to fetch event status', error: error.message });
     }
@@ -84,7 +91,8 @@ app.get('/', async (req, res) => {
                         <h2 style="color: #b45309; margin-top: 0;">🔔 Event Processing</h2>
                         <button id="publishButton" style="padding: 12px 20px; font-size: 16px; border:none; border-radius: 6px; background:#2563eb; color:#fff; cursor:pointer;">Publish Event</button>
                         <p id="publishMessage" style="margin: 16px 0 0; color:#334155;">Click to publish a demo event into the pub/sub topic.</p>
-                        <div id="eventStatus" style="margin-top: 16px; padding: 12px; background:#ffffff; border:1px solid #e2e8f0; border-radius: 6px; font-family: monospace;"></div>
+                        <p id="servedFromBadge" style="margin: 12px 0 4px; font-size: 13px; color:#475569;"></p>
+                        <div id="eventStatus" style="margin-top: 4px; padding: 12px; background:#ffffff; border:1px solid #e2e8f0; border-radius: 6px; font-family: monospace;"></div>
                     </div>
                 </div>
 
@@ -93,7 +101,13 @@ app.get('/', async (req, res) => {
                         try {
                             const response = await fetch('/api/event-status');
                             const status = await response.json();
-                            document.getElementById('eventStatus').innerText = JSON.stringify(status, null, 2);
+                            const servedFrom = status._servedFrom;
+                            const payload = Object.fromEntries(Object.entries(status).filter(([k]) => k !== '_servedFrom'));
+                            const zoneEl = document.getElementById('servedFromBadge');
+                            if (servedFrom) {
+                                zoneEl.innerHTML = '🌐 Refreshed from: <strong>' + (servedFrom.region || 'unknown') + '</strong> &nbsp;|&nbsp; Zone: <strong>' + (servedFrom.zone || 'unknown') + '</strong> &nbsp;|&nbsp; Instance: <code style="background:#e2e8f0;padding:2px 5px;">' + (servedFrom.instanceId || 'unknown') + '</code>';
+                            }
+                            document.getElementById('eventStatus').innerText = JSON.stringify(payload, null, 2);
                         } catch (error) {
                             document.getElementById('eventStatus').innerText = 'Unable to load event status: ' + error.message;
                         }
