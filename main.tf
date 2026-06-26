@@ -32,12 +32,12 @@ variable "workload" {
 
 variable "region_abbr" {
   type    = string
-  default = "ins"
+  default = "cin"
 }
 
 variable "instance" {
   type    = string
-  default = "02"
+  default = "01"
 }
 
 variable "app_version" {
@@ -69,7 +69,7 @@ module "naming" {
 # --- Resource Group ---
 resource "azurerm_resource_group" "main" {
   name     = module.naming.resource_group.name
-  location = "southindia"
+  location = "centralindia"
 }
 
 # --- Virtual Network & Subnets ---
@@ -149,6 +149,18 @@ resource "azurerm_network_security_group" "apim" {
     source_address_prefix      = "AzureLoadBalancer"
     destination_address_prefix = "VirtualNetwork"
   }
+
+  security_rule {
+    name                       = "AllowAPIMWebAppInbound"
+    priority                   = 120
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "80"
+    source_address_prefix      = "VirtualNetwork"
+    destination_address_prefix = "VirtualNetwork"
+  }
 }
 
 resource "azurerm_subnet_network_security_group_association" "apim" {
@@ -182,6 +194,7 @@ resource "azurerm_public_ip" "nat" {
   resource_group_name = azurerm_resource_group.main.name
   allocation_method   = "Static"
   sku                 = "Standard"
+  zones               = ["1", "2", "3"]
 }
 
 resource "azurerm_nat_gateway" "nat" {
@@ -201,13 +214,44 @@ resource "azurerm_subnet_nat_gateway_association" "cae" {
   nat_gateway_id = azurerm_nat_gateway.nat.id
 }
 
+resource "azurerm_network_security_group" "nsg_pe" {
+  location            = azurerm_resource_group.main.location
+  name                = "${module.naming.network_security_group.name}-pe"
+  resource_group_name = azurerm_resource_group.main.name
+  security_rule = [{
+    access                                     = "Deny"
+    description                                = ""
+    destination_address_prefix                 = "*"
+    destination_address_prefixes               = []
+    destination_application_security_group_ids = []
+    destination_port_range                     = "80"
+    destination_port_ranges                    = []
+    direction                                  = "Inbound"
+    name                                       = "DenyInternetInbound"
+    priority                                   = 100
+    protocol                                   = "Tcp"
+    source_address_prefix                      = "Internet"
+    source_address_prefixes                    = []
+    source_application_security_group_ids      = []
+    source_port_range                          = "*"
+    source_port_ranges                         = []
+  }]
+  tags = {}
+}
+
+resource "azurerm_subnet_network_security_group_association" "pe" {
+  subnet_id                 = azurerm_subnet.snet_private_endpoint.id
+  network_security_group_id = azurerm_network_security_group.nsg_pe.id
+}
+
 # --- Azure Container Registry ---
 resource "azurerm_container_registry" "acr" {
-  name                = module.naming.container_registry.name
-  resource_group_name = azurerm_resource_group.main.name
-  location            = azurerm_resource_group.main.location
-  sku                 = "Basic"
-  admin_enabled       = true
+  name                    = module.naming.container_registry.name
+  resource_group_name     = azurerm_resource_group.main.name
+  location                = azurerm_resource_group.main.location
+  sku                     = "Premium"
+  admin_enabled           = true
+  zone_redundancy_enabled = true
 }
 
 # --- Build and push Docker images to ACR ---
@@ -259,6 +303,7 @@ resource "azurerm_container_app_environment" "cae" {
   # Lock it inside the Virtual Network
   infrastructure_subnet_id       = azurerm_subnet.snet_cae.id
   internal_load_balancer_enabled = true
+  zone_redundancy_enabled        = true
 
   # Explicitly define the name Azure created
   infrastructure_resource_group_name = "ME_${module.naming.container_app_environment.name}_${azurerm_resource_group.main.name}_${azurerm_resource_group.main.location}"
@@ -270,6 +315,18 @@ resource "azurerm_container_app_environment" "cae" {
   }
 
   depends_on = [azurerm_subnet_nat_gateway_association.cae]
+}
+
+resource "azurerm_network_security_group" "nsg_cae" {
+  location            = azurerm_resource_group.main.location
+  name                = "${module.naming.network_security_group.name}-cae"
+  resource_group_name = azurerm_resource_group.main.name
+  security_rule       = []
+  tags                = {}
+}
+resource "azurerm_subnet_network_security_group_association" "cae" {
+  subnet_id                 = azurerm_subnet.snet_cae.id
+  network_security_group_id = azurerm_network_security_group.nsg_cae.id
 }
 
 # --- Private DNS Zone for CAE ---
@@ -347,8 +404,8 @@ resource "azurerm_container_app" "backend" {
       }
     }
 
-    min_replicas = 1
-    max_replicas = 1
+    min_replicas = 3
+    max_replicas = 6
   }
 
   ingress {
@@ -407,8 +464,8 @@ resource "azurerm_container_app" "aggregator_backend" {
         value = azurerm_servicebus_topic.demo_events.name
       }
     }
-    min_replicas = 1
-    max_replicas = 1
+    min_replicas = 3
+    max_replicas = 6
   }
 
   # external_enabled = true exposes the aggregator on the Container App
@@ -508,11 +565,13 @@ resource "azurerm_role_assignment" "backend_receiver" {
 
 # --- App Service Plan ---
 resource "azurerm_service_plan" "asp" {
-  name                = module.naming.app_service_plan.name
-  location            = azurerm_resource_group.main.location
-  resource_group_name = azurerm_resource_group.main.name
-  os_type             = "Linux"
-  sku_name            = "B1"
+  name                   = module.naming.app_service_plan.name
+  location               = azurerm_resource_group.main.location
+  resource_group_name    = azurerm_resource_group.main.name
+  os_type                = "Linux"
+  sku_name               = "P1v3"
+  zone_balancing_enabled = true
+  worker_count           = 3
 }
 
 # --- Web App (Frontend) ---
@@ -564,7 +623,38 @@ resource "azurerm_linux_web_app" "frontend" {
   app_settings = {
     "BACKEND_URL"                         = azurerm_api_management.apim.gateway_url
     "WEBSITES_ENABLE_APP_SERVICE_STORAGE" = "false"
+    "REGION_NAME"                         = azurerm_resource_group.main.location
   }
+}
+
+resource "azurerm_network_security_group" "nsg_webapp" {
+  name                = "${module.naming.network_security_group.name}-webapp"
+  location            = azurerm_resource_group.main.location
+  resource_group_name = azurerm_resource_group.main.name
+  security_rule = [{
+    access                                     = "Deny"
+    description                                = ""
+    destination_address_prefix                 = "*"
+    destination_address_prefixes               = []
+    destination_application_security_group_ids = []
+    destination_port_range                     = "80"
+    destination_port_ranges                    = []
+    direction                                  = "Inbound"
+    name                                       = "DenyInternetInbound"
+    priority                                   = 100
+    protocol                                   = "Tcp"
+    source_address_prefix                      = "Internet"
+    source_address_prefixes                    = []
+    source_application_security_group_ids      = []
+    source_port_range                          = "*"
+    source_port_ranges                         = []
+  }]
+  tags = {}
+}
+
+resource "azurerm_subnet_network_security_group_association" "webapp" {
+  subnet_id                 = azurerm_subnet.snet_webapp.id
+  network_security_group_id = azurerm_network_security_group.nsg_webapp.id
 }
 
 resource "azurerm_api_management" "apim" {
@@ -574,8 +664,10 @@ resource "azurerm_api_management" "apim" {
   publisher_name      = module.naming.resource_group.name
   publisher_email     = "admin@example.com"
 
-  # Developer tier supports classic Internal VNet injection (no SLA; demo use).
-  sku_name = "Developer_1"
+  # Premium tier required for Internal VNet injection + zone redundancy.
+  # 2 units distributed across zones — survives any single AZ failure.
+  sku_name = "Premium_3"
+  zones    = ["1", "2", "3"]
 
   # Internal mode — APIM gets a private VIP on snet-apim; no public gateway.
   virtual_network_type = "Internal"
@@ -600,6 +692,7 @@ resource "azurerm_public_ip" "apim" {
   resource_group_name = azurerm_resource_group.main.name
   allocation_method   = "Static"
   sku                 = "Standard"
+  zones               = ["1", "2", "3"]
   domain_name_label   = "mgmt-${module.naming.api_management.name}"
 }
 
@@ -707,6 +800,8 @@ resource "azurerm_public_ip" "apgw" {
   resource_group_name = azurerm_resource_group.main.name
   allocation_method   = "Static"
   sku                 = "Standard"
+  zones               = ["1", "2", "3"]
+  domain_name_label   = "sample-poc"
 }
 
 
@@ -720,7 +815,7 @@ resource "azurerm_application_gateway" "res-0" {
   name                              = module.naming.application_gateway.name
   resource_group_name               = azurerm_resource_group.main.name
   tags                              = {}
-  zones                             = []
+  zones                             = ["1", "2", "3"]
   backend_address_pool {
     name         = "backend-pool-frontend-${var.instance}"
     fqdns        = [azurerm_linux_web_app.frontend.default_hostname]
@@ -786,10 +881,74 @@ resource "azurerm_application_gateway" "res-0" {
     rule_type                  = "Basic"
   }
   sku {
-    capacity = 1
+    capacity = 2
     name     = "WAF_v2"
     tier     = "WAF_v2"
   }
+}
+
+resource "azurerm_network_security_group" "res-0" {
+  location            = azurerm_resource_group.main.location
+  name                = "${module.naming.network_security_group.name}-apgw"
+  resource_group_name = azurerm_resource_group.main.name
+  security_rule = [{
+    access                                     = "Allow"
+    description                                = ""
+    destination_address_prefix                 = "*"
+    destination_address_prefixes               = []
+    destination_application_security_group_ids = []
+    destination_port_range                     = "65200-65535"
+    destination_port_ranges                    = []
+    direction                                  = "Inbound"
+    name                                       = "Allow-AppGateway-V2Ports"
+    priority                                   = 100
+    protocol                                   = "*"
+    source_address_prefix                      = "*"
+    source_address_prefixes                    = []
+    source_application_security_group_ids      = []
+    source_port_range                          = "*"
+    source_port_ranges                         = []
+    }, {
+    access                                     = "Allow"
+    description                                = ""
+    destination_address_prefix                 = "VirtualNetwork"
+    destination_address_prefixes               = []
+    destination_application_security_group_ids = []
+    destination_port_range                     = "80"
+    destination_port_ranges                    = []
+    direction                                  = "Inbound"
+    name                                       = "Allow-Internet-HTTP"
+    priority                                   = 110
+    protocol                                   = "Tcp"
+    source_address_prefix                      = "Internet"
+    source_address_prefixes                    = []
+    source_application_security_group_ids      = []
+    source_port_range                          = "*"
+    source_port_ranges                         = []
+    }, {
+    access                                     = "Allow"
+    description                                = ""
+    destination_address_prefix                 = "VirtualNetwork"
+    destination_address_prefixes               = []
+    destination_application_security_group_ids = []
+    destination_port_range                     = "80"
+    destination_port_ranges                    = []
+    direction                                  = "Outbound"
+    name                                       = "Allow-Outbound-WebApp"
+    priority                                   = 110
+    protocol                                   = "Tcp"
+    source_address_prefix                      = "GatewayManager"
+    source_address_prefixes                    = []
+    source_application_security_group_ids      = []
+    source_port_range                          = "80"
+    source_port_ranges                         = []
+  }]
+  tags = {}
+}
+
+resource "azurerm_subnet_network_security_group_association" "apgw" {
+  subnet_id                 = azurerm_subnet.snet_appgateway.id
+  network_security_group_id = azurerm_network_security_group.res-0.id
 }
 
 # --- Outputs ---
