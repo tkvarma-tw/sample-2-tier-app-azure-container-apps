@@ -1030,9 +1030,14 @@ resource "azurerm_mssql_server" "main" {
     azuread_authentication_only = true
   }
 
-  # Public access stays on so the deployer can use Portal Query Editor to
-  # run seed.sql. The backend reaches SQL via the private endpoint below.
+  # Public access starts enabled so the deployer can run seed.sql via the
+  # public endpoint. null_resource.lockdown_sql disables it after seeding.
+  # ignore_changes prevents Terraform from re-enabling it on subsequent applies.
   public_network_access_enabled = true
+
+  lifecycle {
+    ignore_changes = [public_network_access_enabled]
+  }
 }
 
 # Allow Azure-hosted services (incl. Portal Query Editor and the backend
@@ -1093,6 +1098,26 @@ resource "null_resource" "seed_db" {
     azurerm_mssql_firewall_rule.deployer,
     azurerm_container_app.backend,
   ]
+}
+
+# Disable public network access on the SQL server once seeding is done.
+# The backend reaches SQL exclusively via the private endpoint, so public
+# access is not needed at runtime. Re-runs whenever seed_db re-runs.
+resource "null_resource" "lockdown_sql" {
+  triggers = {
+    seed_hash = filemd5("${path.root}/sql/seed.sql")
+  }
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      az sql server update \
+        --resource-group ${azurerm_resource_group.main.name} \
+        --name ${azurerm_mssql_server.main.name} \
+        --enable-public-network false
+    EOT
+  }
+
+  depends_on = [null_resource.seed_db]
 }
 
 resource "azurerm_mssql_database" "main" {
