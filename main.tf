@@ -662,7 +662,6 @@ resource "azurerm_linux_web_app" "frontend" {
       action   = "Allow"
       name     = "InboundRuleWebApp${var.instance}"
       priority = 1
-      # virtual_network_subnet_id = "/subscriptions/bf64dbbf-7dac-472e-92ca-6ee6c08d1055/resourceGroups/rg-howden-dev-ins-01/providers/Microsoft.Network/virtualNetworks/vnet-howden-dev-ins-01/subnets/snet-appgateway"
       virtual_network_subnet_id = azurerm_subnet.snet_appgateway.id
     }
   }
@@ -873,7 +872,6 @@ resource "azurerm_public_ip" "apgw" {
 resource "azurerm_application_gateway" "res-0" {
   fips_enabled       = false
   firewall_policy_id = azurerm_web_application_firewall_policy.res-0.id
-  # firewall_policy_id                = "/subscriptions/bf64dbbf-7dac-472e-92ca-6ee6c08d1055/resourceGroups/rg-howden-dev-ins-01/providers/Microsoft.Network/applicationGatewayWebApplicationFirewallPolicies/wafhowdendevins01"
   force_firewall_policy_association = false
   location                          = azurerm_resource_group.main.location
   name                              = module.naming.application_gateway.name
@@ -916,7 +914,6 @@ resource "azurerm_application_gateway" "res-0" {
   gateway_ip_configuration {
     name      = "appGatewayIpConfig"
     subnet_id = azurerm_subnet.snet_appgateway.id
-    # subnet_id = "/subscriptions/bf64dbbf-7dac-472e-92ca-6ee6c08d1055/resourceGroups/rg-howden-dev-ins-01/providers/Microsoft.Network/virtualNetworks/vnet-howden-dev-ins-01/subnets/snet-appgateway"
   }
   http_listener {
     frontend_ip_configuration_name = "appGwPublicFrontendIpIPv4"
@@ -1040,33 +1037,13 @@ resource "azurerm_mssql_server" "main" {
   }
 }
 
-# Allow Azure-hosted services (incl. Portal Query Editor and the backend
-# Container App fallback path) to reach the SQL server over its public
-# endpoint. The backend normally resolves via the private DNS zone.
-resource "azurerm_mssql_firewall_rule" "azure_services" {
-  name             = "AllowAzureServices"
-  server_id        = azurerm_mssql_server.main.id
-  start_ip_address = "0.0.0.0"
-  end_ip_address   = "0.0.0.0"
-}
-
-# Detect the public IP of the machine running terraform apply so sqlcmd
-# can reach the SQL server's public endpoint during the seed step.
-data "http" "deployer_ip" {
-  url = "https://api.ipify.org"
-}
-
-resource "azurerm_mssql_firewall_rule" "deployer" {
-  name             = "AllowDeployerIP"
-  server_id        = azurerm_mssql_server.main.id
-  start_ip_address = data.http.deployer_ip.response_body
-  end_ip_address   = data.http.deployer_ip.response_body
-}
-
 # Run seed.sql (schema + data) and grant the backend managed identity
 # db_datareader access. Uses ambient Azure CLI credentials
 # (ActiveDirectoryDefault) — no passwords in code.
 # Re-runs automatically when seed.sql changes (filemd5 trigger).
+#
+# Firewall rules are created here as ephemeral CLI operations (not Terraform
+# resources) so they cannot conflict with lockdown_sql disabling public access.
 resource "null_resource" "seed_db" {
   triggers = {
     seed_hash = filemd5("${path.root}/sql/seed.sql")
@@ -1076,6 +1053,27 @@ resource "null_resource" "seed_db" {
   provisioner "local-exec" {
     command     = <<-EOT
       set -e
+
+      RG=${azurerm_resource_group.main.name}
+      SRV=${azurerm_mssql_server.main.name}
+      DEPLOYER_IP=$(curl -sf https://api.ipify.org)
+
+      # Re-enable public access in case a previous lockdown_sql run disabled it
+      az sql server update \
+        --resource-group "$RG" \
+        --name "$SRV" \
+        --enable-public-network true
+
+      # Open firewall for the duration of seeding
+      az sql server firewall-rule create \
+        --resource-group "$RG" --server "$SRV" \
+        --name AllowAzureServices \
+        --start-ip-address 0.0.0.0 --end-ip-address 0.0.0.0
+
+      az sql server firewall-rule create \
+        --resource-group "$RG" --server "$SRV" \
+        --name AllowDeployerIP \
+        --start-ip-address "$DEPLOYER_IP" --end-ip-address "$DEPLOYER_IP"
 
       # Part 1: idempotent schema + sample data
       sqlcmd -S ${azurerm_mssql_server.main.fully_qualified_domain_name} \
@@ -1094,15 +1092,13 @@ resource "null_resource" "seed_db" {
 
   depends_on = [
     azurerm_mssql_database.main,
-    azurerm_mssql_firewall_rule.azure_services,
-    azurerm_mssql_firewall_rule.deployer,
     azurerm_container_app.backend,
   ]
 }
 
 # Disable public network access on the SQL server once seeding is done.
-# The backend reaches SQL exclusively via the private endpoint, so public
-# access is not needed at runtime. Re-runs whenever seed_db re-runs.
+# Deletes the ephemeral firewall rules first, then locks down the server.
+# The backend reaches SQL exclusively via the private endpoint at runtime.
 resource "null_resource" "lockdown_sql" {
   triggers = {
     seed_hash = filemd5("${path.root}/sql/seed.sql")
@@ -1110,9 +1106,23 @@ resource "null_resource" "lockdown_sql" {
 
   provisioner "local-exec" {
     command = <<-EOT
+      set -e
+
+      RG=${azurerm_resource_group.main.name}
+      SRV=${azurerm_mssql_server.main.name}
+
+      # Remove ephemeral firewall rules before disabling public access
+      az sql server firewall-rule delete \
+        --resource-group "$RG" --server "$SRV" \
+        --name AllowDeployerIP --yes 2>/dev/null || true
+
+      az sql server firewall-rule delete \
+        --resource-group "$RG" --server "$SRV" \
+        --name AllowAzureServices --yes 2>/dev/null || true
+
       az sql server update \
-        --resource-group ${azurerm_resource_group.main.name} \
-        --name ${azurerm_mssql_server.main.name} \
+        --resource-group "$RG" \
+        --name "$SRV" \
         --enable-public-network false
     EOT
   }
@@ -1121,9 +1131,10 @@ resource "null_resource" "lockdown_sql" {
 }
 
 resource "azurerm_mssql_database" "main" {
-  name      = module.naming.mssql_database.name
-  server_id = azurerm_mssql_server.main.id
-  sku_name  = "S0"
+  name           = module.naming.mssql_database.name
+  server_id      = azurerm_mssql_server.main.id
+  sku_name       = "GP_Gen5_2"
+  zone_redundant = true
 }
 
 # --- Private Endpoint for SQL ---
