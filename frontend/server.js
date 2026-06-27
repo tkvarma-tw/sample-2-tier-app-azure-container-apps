@@ -57,9 +57,19 @@ app.get('/api/event-status', async (req, res) => {
 
 app.get('/', async (req, res) => {
     try {
-        const response = await axios.get(`${BACKEND_URL}/api/aggregated-data`, { timeout: 5000 });
+        const [aggResponse, sqlResponse] = await Promise.allSettled([
+            axios.get(`${BACKEND_URL}/api/aggregated-data`, { timeout: 5000 }),
+            axios.get(`${BACKEND_URL}/api/sql-data`, { timeout: 8000 })
+        ]);
+
+        if (aggResponse.status === 'rejected') throw aggResponse.reason;
+        const response = aggResponse.value;
         const data = response.data;
         const w = data.weather || {};
+
+        const sqlData = sqlResponse.status === 'fulfilled' ? sqlResponse.value.data : null;
+        const sqlRecords = sqlData?.records || [];
+        const sqlError = sqlResponse.status === 'rejected' ? sqlResponse.reason.message : (sqlData?.status === 'Error' ? sqlData.message : null);
 
         // APIM stamps this response header via an outbound policy; the aggregator
         // never sets it, so its presence proves the call traversed APIM.
@@ -67,6 +77,57 @@ app.get('/', async (req, res) => {
         const apimBadge = apimName
             ? `<p style="color:#15803d;">✅ Routed through Azure APIM: <code style="background:#e2e8f0; padding:2px 6px;">${apimName}</code></p>`
             : `<p style="color:#b45309;">⚠️ APIM marker header not present — request may not have traversed APIM.</p>`;
+
+        const sqlTableRows = sqlRecords.map(r => `
+            <tr>
+                <td style="padding:6px 10px;">${r.PolicyNumber}</td>
+                <td style="padding:6px 10px;">${r.PolicyHolder}</td>
+                <td style="padding:6px 10px;">${r.PolicyType}</td>
+                <td style="padding:6px 10px; text-align:right;">£${Number(r.Premium).toLocaleString('en-GB', { minimumFractionDigits: 2 })}</td>
+                <td style="padding:6px 10px;">${r.StartDate ? r.StartDate.toString().slice(0,10) : ''}</td>
+                <td style="padding:6px 10px;">${r.EndDate ? r.EndDate.toString().slice(0,10) : ''}</td>
+                <td style="padding:6px 10px;">
+                    <span style="padding:2px 8px; border-radius:9999px; font-size:12px; font-weight:600;
+                        background:${r.Status === 'Active' ? '#dcfce7' : '#fee2e2'};
+                        color:${r.Status === 'Active' ? '#15803d' : '#b91c1c'};">
+                        ${r.Status}
+                    </span>
+                </td>
+            </tr>`).join('');
+
+        const sqlPanel = sqlError
+            ? `<div style="border:2px solid #ef4444; padding:20px; border-radius:8px; background:#fef2f2; max-width:860px; text-align:left;">
+                   <h2 style="color:#b91c1c; margin-top:0;">🗄️ Policy Records (Azure SQL)</h2>
+                   <p style="color:#dc2626;">Error: ${sqlError}</p>
+                   <p style="font-size:13px; color:#6b7280;">Run <code>sql/seed.sql</code> against the database and restart the backend Container App.</p>
+               </div>`
+            : `<div style="border:2px solid #7c3aed; padding:20px; border-radius:8px; background:#faf5ff; max-width:860px; text-align:left;">
+                   <h2 style="color:#6d28d9; margin-top:0;">🗄️ Policy Records (Azure SQL — via Managed Identity)</h2>
+                   <p style="font-size:13px; color:#6b7280; margin:0 0 12px;">
+                       Source: <code style="background:#e2e8f0; padding:2px 6px;">${sqlData?.server || SQL_SERVER || 'SQL Server'}</code>
+                       &nbsp;|&nbsp; Database: <code style="background:#e2e8f0; padding:2px 6px;">${sqlData?.database || 'demodb'}</code>
+                       &nbsp;|&nbsp; ${sqlRecords.length} record(s)
+                   </p>
+                   ${sqlRecords.length === 0
+                       ? '<p style="color:#6b7280;">No records found — run <code>sql/seed.sql</code> to seed sample data.</p>'
+                       : `<div style="overflow-x:auto;">
+                          <table style="width:100%; border-collapse:collapse; font-size:14px;">
+                              <thead>
+                                  <tr style="background:#ede9fe; color:#4c1d95;">
+                                      <th style="padding:8px 10px; text-align:left; border-bottom:2px solid #c4b5fd;">Policy #</th>
+                                      <th style="padding:8px 10px; text-align:left; border-bottom:2px solid #c4b5fd;">Holder</th>
+                                      <th style="padding:8px 10px; text-align:left; border-bottom:2px solid #c4b5fd;">Type</th>
+                                      <th style="padding:8px 10px; text-align:right; border-bottom:2px solid #c4b5fd;">Premium</th>
+                                      <th style="padding:8px 10px; text-align:left; border-bottom:2px solid #c4b5fd;">Start</th>
+                                      <th style="padding:8px 10px; text-align:left; border-bottom:2px solid #c4b5fd;">End</th>
+                                      <th style="padding:8px 10px; text-align:left; border-bottom:2px solid #c4b5fd;">Status</th>
+                                  </tr>
+                              </thead>
+                              <tbody>${sqlTableRows}</tbody>
+                          </table>
+                          </div>`
+                   }
+               </div>`;
 
         res.send(`
             <html>
@@ -94,6 +155,8 @@ app.get('/', async (req, res) => {
                         <p id="servedFromBadge" style="margin: 12px 0 4px; font-size: 13px; color:#475569;"></p>
                         <div id="eventStatus" style="margin-top: 4px; padding: 12px; background:#ffffff; border:1px solid #e2e8f0; border-radius: 6px; font-family: monospace;"></div>
                     </div>
+
+                    ${sqlPanel}
                 </div>
 
                 <script>

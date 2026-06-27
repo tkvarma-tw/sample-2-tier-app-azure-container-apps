@@ -12,14 +12,19 @@ terraform {
       source  = "hashicorp/random"
       version = "~> 3.9.0"
     }
+    http = {
+      source  = "hashicorp/http"
+      version = "~> 3.4.0"
+    }
   }
 }
+
 
 provider "azurerm" {
   features {}
 }
 
-# --- Variables ---
+# --- Variables ---seed_db
 variable "environment" {
   type    = string
   default = "dev"
@@ -57,6 +62,8 @@ variable "weather_longitude" {
   default     = "78.4867"
   description = "Longitude the backend uses to query the public weather API (default: Hyderabad)"
 }
+
+data "azurerm_client_config" "current" {}
 
 
 # --- Official Azure Naming Module ---
@@ -268,30 +275,60 @@ resource "azurerm_role_assignment" "uami_acr_pull" {
   principal_id         = azurerm_user_assigned_identity.container_app_identity.principal_id
 }
 
-# --- Build and push Docker images to ACR ---
-resource "null_resource" "docker_images" {
+# --- Build and push Docker images to ACR (parallel per-service resources) ---
+# Splitting into three null_resources lets Terraform schedule all three Docker
+# builds concurrently. Each Container App / Web App only waits for its own image.
+resource "null_resource" "docker_backend" {
+  triggers = {
+    version_tag       = var.app_version
+    backend_code_hash = filemd5("${path.root}/backend/server.js")
+  }
+
+  provisioner "local-exec" {
+    command     = <<-EOT
+      set -e
+      docker logout ${azurerm_container_registry.acr.login_server} 2>/dev/null || true
+      az acr login --name ${azurerm_container_registry.acr.name} --resource-group ${azurerm_resource_group.main.name}
+      docker build --platform=linux/amd64 -t ${azurerm_container_registry.acr.login_server}/demo-backend:${var.app_version} ./backend
+      docker push ${azurerm_container_registry.acr.login_server}/demo-backend:${var.app_version}
+    EOT
+    working_dir = path.root
+  }
+
+  depends_on = [azurerm_container_registry.acr]
+}
+
+resource "null_resource" "docker_aggregator" {
+  triggers = {
+    version_tag           = var.app_version
+    aggregator_code_hash  = filemd5("${path.root}/aggregator-backend/server.js")
+  }
+
+  provisioner "local-exec" {
+    command     = <<-EOT
+      set -e
+      docker logout ${azurerm_container_registry.acr.login_server} 2>/dev/null || true
+      az acr login --name ${azurerm_container_registry.acr.name} --resource-group ${azurerm_resource_group.main.name}
+      docker build --platform=linux/amd64 -t ${azurerm_container_registry.acr.login_server}/demo-aggregator-backend:${var.app_version} ./aggregator-backend
+      docker push ${azurerm_container_registry.acr.login_server}/demo-aggregator-backend:${var.app_version}
+    EOT
+    working_dir = path.root
+  }
+
+  depends_on = [azurerm_container_registry.acr]
+}
+
+resource "null_resource" "docker_frontend" {
   triggers = {
     version_tag        = var.app_version
-    backend_code_hash  = filemd5("${path.root}/backend/server.js")
     frontend_code_hash = filemd5("${path.root}/frontend/server.js")
   }
 
   provisioner "local-exec" {
     command     = <<-EOT
       set -e
-
-      # Login to ACR
+      docker logout ${azurerm_container_registry.acr.login_server} 2>/dev/null || true
       az acr login --name ${azurerm_container_registry.acr.name} --resource-group ${azurerm_resource_group.main.name}
-
-      # Build and push backend image
-      docker build --platform=linux/amd64 -t ${azurerm_container_registry.acr.login_server}/demo-backend:${var.app_version} ./backend
-      docker push ${azurerm_container_registry.acr.login_server}/demo-backend:${var.app_version}
-
-      # Build and push aggregator backend image
-      docker build --platform=linux/amd64 -t ${azurerm_container_registry.acr.login_server}/demo-aggregator-backend:${var.app_version} ./aggregator-backend
-      docker push ${azurerm_container_registry.acr.login_server}/demo-aggregator-backend:${var.app_version}
-
-      # Build and push frontend image
       docker build --platform=linux/amd64 -t ${azurerm_container_registry.acr.login_server}/demo-frontend:${var.app_version} ./frontend
       docker push ${azurerm_container_registry.acr.login_server}/demo-frontend:${var.app_version}
     EOT
@@ -377,8 +414,7 @@ resource "azurerm_container_app" "backend" {
     identity_ids = [azurerm_user_assigned_identity.container_app_identity.id]
   }
 
-  # Crucial: Wait for the images to be pushed before deploying
-  depends_on = [null_resource.docker_images]
+  depends_on = [null_resource.docker_backend]
 
   registry {
     server   = azurerm_container_registry.acr.login_server
@@ -411,6 +447,14 @@ resource "azurerm_container_app" "backend" {
         name  = "SERVICEBUS_SUBSCRIPTION_NAME"
         value = azurerm_servicebus_subscription.demo_processor.name
       }
+      env {
+        name  = "SQL_SERVER"
+        value = "${azurerm_mssql_server.main.name}.database.windows.net"
+      }
+      env {
+        name  = "SQL_DATABASE"
+        value = azurerm_mssql_database.main.name
+      }
     }
 
     min_replicas = 3
@@ -441,7 +485,7 @@ resource "azurerm_container_app" "aggregator_backend" {
     identity_ids = [azurerm_user_assigned_identity.container_app_identity.id]
   }
 
-  depends_on = [null_resource.docker_images]
+  depends_on = [null_resource.docker_aggregator]
 
   registry {
     server   = azurerm_container_registry.acr.login_server
@@ -595,8 +639,7 @@ resource "azurerm_linux_web_app" "frontend" {
   # exists, which breaks the gateway with 502.
   public_network_access_enabled = true
 
-  # Crucial: Wait for the images to be pushed before deploying
-  depends_on = [null_resource.docker_images]
+  depends_on = [null_resource.docker_frontend]
 
   site_config {
     # Force traffic to use Private DNS for resolution
@@ -625,7 +668,11 @@ resource "azurerm_linux_web_app" "frontend" {
   }
 
   app_settings = {
-    "BACKEND_URL"                         = azurerm_api_management.apim.gateway_url
+    # APIM gateway URL is always https://<name>.azure-api.net — known at plan
+    # time from the naming module, so we don't need to wait for APIM to finish
+    # provisioning (which takes 30-45 min). This lets the Frontend and App
+    # Gateway deploy in parallel with APIM.
+    "BACKEND_URL"                         = "https://${module.naming.api_management.name}.azure-api.net"
     "WEBSITES_ENABLE_APP_SERVICE_STORAGE" = "false"
     "REGION_NAME"                         = azurerm_resource_group.main.location
   }
@@ -755,6 +802,19 @@ resource "azurerm_api_management_api_operation" "aggregated_data" {
   }
 }
 
+resource "azurerm_api_management_api_operation" "sql_data" {
+  operation_id        = "sql-data"
+  api_name            = azurerm_api_management_api.aggregator.name
+  api_management_name = azurerm_api_management.apim.name
+  resource_group_name = azurerm_resource_group.main.name
+  display_name        = "SQL Data"
+  method              = "GET"
+  url_template        = "/sql-data"
+  response {
+    status_code = 200
+  }
+}
+
 # --- APIM policy: stamp a response header so the demo can prove traffic
 # actually passed through APIM (the aggregator never sets this header). ---
 resource "azurerm_api_management_api_policy" "aggregator" {
@@ -821,8 +881,10 @@ resource "azurerm_application_gateway" "res-0" {
   tags                              = {}
   zones                             = ["1", "2", "3"]
   backend_address_pool {
-    name         = "backend-pool-frontend-${var.instance}"
-    fqdns        = [azurerm_linux_web_app.frontend.default_hostname]
+    name = "backend-pool-frontend-${var.instance}"
+    # Pre-compute the hostname so App Gateway doesn't wait for the Frontend Web
+    # App to finish provisioning. Both can now deploy in parallel (~11 min each).
+    fqdns        = ["${module.naming.app_service.name}-${random_string.frontend_suffix.result}.azurewebsites.net"]
     ip_addresses = []
   }
 
@@ -955,6 +1017,126 @@ resource "azurerm_subnet_network_security_group_association" "apgw" {
   network_security_group_id = azurerm_network_security_group.res-0.id
 }
 
+# --- Azure SQL Server & Database ---
+resource "azurerm_mssql_server" "main" {
+  name                = "sql-${var.workload}-${var.environment}-${var.region_abbr}-${var.instance}"
+  resource_group_name = azurerm_resource_group.main.name
+  location            = azurerm_resource_group.main.location
+  version             = "12.0"
+
+  azuread_administrator {
+    login_username              = data.azurerm_client_config.current.object_id
+    object_id                   = data.azurerm_client_config.current.object_id
+    azuread_authentication_only = true
+  }
+
+  # Public access stays on so the deployer can use Portal Query Editor to
+  # run seed.sql. The backend reaches SQL via the private endpoint below.
+  public_network_access_enabled = true
+}
+
+# Allow Azure-hosted services (incl. Portal Query Editor and the backend
+# Container App fallback path) to reach the SQL server over its public
+# endpoint. The backend normally resolves via the private DNS zone.
+resource "azurerm_mssql_firewall_rule" "azure_services" {
+  name             = "AllowAzureServices"
+  server_id        = azurerm_mssql_server.main.id
+  start_ip_address = "0.0.0.0"
+  end_ip_address   = "0.0.0.0"
+}
+
+# Detect the public IP of the machine running terraform apply so sqlcmd
+# can reach the SQL server's public endpoint during the seed step.
+data "http" "deployer_ip" {
+  url = "https://api.ipify.org"
+}
+
+resource "azurerm_mssql_firewall_rule" "deployer" {
+  name             = "AllowDeployerIP"
+  server_id        = azurerm_mssql_server.main.id
+  start_ip_address = data.http.deployer_ip.response_body
+  end_ip_address   = data.http.deployer_ip.response_body
+}
+
+# Run seed.sql (schema + data) and grant the backend managed identity
+# db_datareader access. Uses ambient Azure CLI credentials
+# (ActiveDirectoryDefault) — no passwords in code.
+# Re-runs automatically when seed.sql changes (filemd5 trigger).
+resource "null_resource" "seed_db" {
+  triggers = {
+    seed_hash = filemd5("${path.root}/sql/seed.sql")
+    ca_name   = azurerm_container_app.backend.name
+  }
+
+  provisioner "local-exec" {
+    command     = <<-EOT
+      set -e
+
+      # Part 1: idempotent schema + sample data
+      sqlcmd -S ${azurerm_mssql_server.main.fully_qualified_domain_name} \
+             -d ${azurerm_mssql_database.main.name} \
+             --authentication-method=ActiveDirectoryDefault \
+             -i ${path.root}/sql/seed.sql
+
+      # Part 2: grant backend managed identity db_datareader (idempotent)
+      sqlcmd -S ${azurerm_mssql_server.main.fully_qualified_domain_name} \
+             -d ${azurerm_mssql_database.main.name} \
+             --authentication-method=ActiveDirectoryDefault \
+             -Q "IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = '${azurerm_container_app.backend.name}') BEGIN CREATE USER [${azurerm_container_app.backend.name}] FROM EXTERNAL PROVIDER; ALTER ROLE db_datareader ADD MEMBER [${azurerm_container_app.backend.name}]; END"
+    EOT
+    working_dir = path.root
+  }
+
+  depends_on = [
+    azurerm_mssql_database.main,
+    azurerm_mssql_firewall_rule.azure_services,
+    azurerm_mssql_firewall_rule.deployer,
+    azurerm_container_app.backend,
+  ]
+}
+
+resource "azurerm_mssql_database" "main" {
+  name      = module.naming.mssql_database.name
+  server_id = azurerm_mssql_server.main.id
+  sku_name  = "S0"
+}
+
+# --- Private Endpoint for SQL ---
+resource "azurerm_private_endpoint" "sql" {
+  name                = "${module.naming.private_endpoint.name}-sql"
+  location            = azurerm_resource_group.main.location
+  resource_group_name = azurerm_resource_group.main.name
+  subnet_id           = azurerm_subnet.snet_private_endpoint.id
+
+  private_service_connection {
+    name                           = "${module.naming.private_service_connection.name}-sql"
+    private_connection_resource_id = azurerm_mssql_server.main.id
+    subresource_names              = ["sqlServer"]
+    is_manual_connection           = false
+  }
+}
+
+resource "azurerm_private_dns_zone" "sql" {
+  name                = "privatelink.database.windows.net"
+  resource_group_name = azurerm_resource_group.main.name
+}
+
+resource "azurerm_private_dns_zone_virtual_network_link" "sql_vnet_link" {
+  name                  = "sql-vnet-link"
+  resource_group_name   = azurerm_resource_group.main.name
+  private_dns_zone_name = azurerm_private_dns_zone.sql.name
+  virtual_network_id    = azurerm_virtual_network.vnet.id
+  registration_enabled  = false
+}
+
+resource "azurerm_private_dns_a_record" "sql" {
+  name                = azurerm_mssql_server.main.name
+  zone_name           = azurerm_private_dns_zone.sql.name
+  resource_group_name = azurerm_resource_group.main.name
+  ttl                 = 300
+  records             = [azurerm_private_endpoint.sql.private_service_connection[0].private_ip_address]
+}
+
 # --- Outputs ---
 output "acr_login_server" {
   value = azurerm_container_registry.acr.login_server
@@ -1012,6 +1194,22 @@ output "apim_gateway_url" {
 output "apim_name" {
   value       = azurerm_api_management.apim.name
   description = "The API Management service name."
+}
+
+output "gateway_url" {
+  value       = azurerm_public_ip.apgw.fqdn
+  description = "The Application gateway url"
+}
+
+output "sql_server_fqdn" {
+  value       = "${azurerm_mssql_server.main.name}.database.windows.net"
+  description = "SQL Server FQDN — use this in Portal Query Editor or sqlcmd to run seed.sql."
+}
+
+
+output "backend_container_app_name" {
+  value       = azurerm_container_app.backend.name
+  description = "Backend Container App name — use as <backend-container-app-name> in seed.sql Part 2."
 }
 
 # --- Private DNS for APIM (Internal VNet mode) ---
