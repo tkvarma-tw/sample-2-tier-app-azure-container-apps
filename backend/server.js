@@ -2,6 +2,7 @@ const express = require('express');
 const axios = require('axios');
 const { ServiceBusClient } = require('@azure/service-bus');
 const { ManagedIdentityCredential } = require('@azure/identity');
+const sql = require('mssql');
 const app = express();
 const PORT = process.env.PORT || 80;
 
@@ -12,6 +13,35 @@ const WEATHER_URL = `https://api.met.no/weatherapi/locationforecast/2.0/compact?
 const SERVICEBUS_NAMESPACE = process.env.SERVICEBUS_NAMESPACE;
 const SERVICEBUS_TOPIC_NAME = process.env.SERVICEBUS_TOPIC_NAME || 'demo-events';
 const SERVICEBUS_SUBSCRIPTION_NAME = process.env.SERVICEBUS_SUBSCRIPTION_NAME || 'demo-processor';
+
+const SQL_SERVER = process.env.SQL_SERVER;
+const SQL_DATABASE = process.env.SQL_DATABASE || 'demodb';
+
+// Cached SQL connection pool — refreshed before the token expires (~1 h).
+let sqlPool = null;
+let sqlTokenExpiry = 0;
+
+async function getSqlPool() {
+    const now = Date.now();
+    if (sqlPool && now < sqlTokenExpiry - 60_000) return sqlPool;
+
+    if (sqlPool) { try { await sqlPool.close(); } catch (_) {} sqlPool = null; }
+
+    const credential = new ManagedIdentityCredential();
+    const tokenResponse = await credential.getToken('https://database.windows.net/.default');
+    sqlTokenExpiry = tokenResponse.expiresOnTimestamp;
+
+    sqlPool = await sql.connect({
+        server: SQL_SERVER,
+        database: SQL_DATABASE,
+        authentication: {
+            type: 'azure-active-directory-access-token',
+            options: { token: tokenResponse.token }
+        },
+        options: { encrypt: true, trustServerCertificate: false, port: 1433 }
+    });
+    return sqlPool;
+}
 
 const processedEvents = [];
 
@@ -73,6 +103,27 @@ app.get('/api/event-status', (req, res) => {
         latestProcessedEvent: processedEvents.length ? processedEvents[processedEvents.length - 1] : null,
         processedCount: processedEvents.length
     });
+});
+
+app.get('/api/sql-data', async (req, res) => {
+    if (!SQL_SERVER) {
+        return res.status(503).json({ status: 'Error', message: 'SQL_SERVER is not configured.' });
+    }
+    try {
+        const pool = await getSqlPool();
+        const result = await pool.request()
+            .query('SELECT TOP 10 Id, PolicyNumber, PolicyHolder, PolicyType, Premium, StartDate, EndDate, Status FROM PolicyRecords ORDER BY Id');
+        res.json({
+            status: 'Success',
+            source: 'Azure SQL Database (via Managed Identity)',
+            server: SQL_SERVER,
+            database: SQL_DATABASE,
+            records: result.recordset
+        });
+    } catch (error) {
+        console.error('SQL query failed:', error.message);
+        res.status(502).json({ status: 'Error', message: 'Failed to query SQL database', error: error.message });
+    }
 });
 
 function startServiceBusReceiver() {

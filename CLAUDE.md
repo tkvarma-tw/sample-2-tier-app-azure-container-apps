@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Big Picture
 
-This is a **single-file Terraform project** (`main.tf`, ~850 lines) that provisions a complete Azure application architecture and deploys three Node.js/Express microservices. There are no `package.json` files committed — dependencies are installed at Docker build time via `npm install` in each Dockerfile. Region is `southindia`.
+This is a **single-file Terraform project** (`main.tf`, ~850 lines) that provisions a complete Azure application architecture and deploys three Node.js/Express microservices. There are no `package.json` files committed — dependencies are installed at Docker build time via `npm install` in each Dockerfile. Region is `centralindia`.
 
 ### Architecture (request path)
 

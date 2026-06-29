@@ -118,6 +118,25 @@ app.get('/api/aggregated-data', async (req, res) => {
     }
 });
 
+app.get('/api/sql-data', async (req, res) => {
+    if (!BACKEND_A_URL) {
+        return res.status(500).json({
+            status: 'Error',
+            message: 'Configuration error: BACKEND_A_URL environment variable is missing.'
+        });
+    }
+    try {
+        const response = await axios.get(`${BACKEND_A_URL}/api/sql-data`, { timeout: 8000 });
+        res.json(response.data);
+    } catch (error) {
+        res.status(502).json({
+            status: 'Upstream Error',
+            message: `Failed to fetch SQL data from backend at ${BACKEND_A_URL}`,
+            error: error.message
+        });
+    }
+});
+
 app.listen(PORT, () => {
     console.log(`New Backend Service B listening on port ${PORT}`);
 });
